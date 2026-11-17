@@ -1,12 +1,12 @@
 # SDS100 Monitor User Manual
 
-Version 1.1.84 · by J. Lynch, developed with the help of AI (Anthropic's Claude) · [PDF with each release](https://github.com/jmlynchjr/SDS-MONITOR/releases)
+Version 1.1.89 · by J. Lynch, developed with the help of AI (Anthropic's Claude) · [PDF with each release](https://github.com/jmlynchjr/SDS-MONITOR/releases)
 
 Use the outline button (☰) at the top right of this file to jump to a chapter.
 
 ## About this manual
 
-This manual describes **SDS100 Monitor version 1.1.65**, a Linux program for monitoring and controlling a Uniden SDS100 scanner from a PC over its USB cable. It runs on desktop Linux PCs and on the Raspberry Pi (chapter 25).
+This manual describes **SDS100 Monitor version 1.1.89**, a Linux program for monitoring and controlling a Uniden SDS100 scanner from a PC over its USB cable. It also works with the SDS150, and with the SDS200 over USB or its network port (chapter 3). It runs on desktop Linux PCs and on the Raspberry Pi (chapter 25).
 
 The chapters follow the program's menus and panels. Chapters 1 to 4 cover installing, connecting and the main window, and are worth reading first. The rest can be read as you need them.
 
@@ -64,10 +64,10 @@ SDS100 Monitor connects to the SDS100's USB port and reads the scanner's status 
 ### What you need
 
 - A PC running Linux with **Python 3.10 or newer**. The program is developed on **Kubuntu**; the install steps here are for Kubuntu and other Debian- and Ubuntu-based systems, including **Raspberry Pi OS** (chapter 25).
-- A Uniden **SDS100** and its USB cable. The program is written for the SDS100. An SDS200 may work for much of it, but isn't tested.
+- A Uniden **SDS100** or **SDS150** and its USB cable, or an **SDS200** connected by USB or to your network. The program is written for the SDS100; a user has confirmed that it works with the SDS150 as it is. The SDS200's network connection (chapter 3) is new in version 1.1.89 and hasn't been tested on a real SDS200 yet.
 - Python 3 with PyQt6 and pyserial, installed from the system packages (see chapter 2).
 - Optional, for some features:
-  - **PC audio capture:** a cable from the scanner's headphone jack to the PC's line-in or a USB sound card, plus Qt Multimedia and `ffmpeg`.
+  - **PC audio capture:** a cable from the scanner's headphone jack to the PC's line-in or a USB sound card, plus Qt Multimedia and `ffmpeg`. An SDS200 on the network can send its audio over the network instead, with no cable (chapter 9).
   - **Transcription:** about 300 MB of disk for the speech engine plus the model, and `python3-venv`. An NVIDIA graphics card makes it faster but isn't needed.
   - **GPS:** a USB GPS receiver, or a phone that can send its position over Wi-Fi.
   - **Places and Map:** an internet connection, for address lookups and map tiles.
@@ -82,6 +82,8 @@ The SDS100's USB port appears on the PC as a serial port, usually `/dev/ttyACM0`
 
 The SDS100's USB port carries data only, not audio. Audio for recording and transcription comes from the headphone jack (chapter 9).
 
+The SDS200 also has a network (Ethernet) port. Over it, the program sends the same commands as UDP messages to port 50536, and can receive the scanner's audio as an RTSP stream (chapters 3 and 9).
+
 ## 2. Installing
 
 ### Install the package (recommended)
@@ -91,7 +93,7 @@ SDS100 Monitor is installed as a Debian package, which apt sets up together with
 1. Download `sds100-monitor_<version>_all.deb` from the project's releases page, **github.com/jmlynchjr/SDS-MONITOR/releases**.
 2. In a terminal, in the folder you downloaded it to, run:
 
-   `sudo apt install ./sds100-monitor_1.1.65_all.deb`
+   `sudo apt install ./sds100-monitor_1.1.89_all.deb`
 
    (use the version you downloaded). apt also installs PyQt6 and pyserial if they're missing, and Qt Multimedia and `ffmpeg`, which PC audio capture needs (chapter 9).
 
@@ -154,8 +156,9 @@ The top of the main window has the connection controls:
 
 | Control | What it does |
 |---|---|
-| **Port** | The scanner's serial port. The list shows the ports found; you can also type one. Usually `/dev/ttyACM0`. |
-| **Baud** | Serial speed. Leave it at **115200**. |
+| **Link** | **USB** (every model) or **Network (SDS200)**. |
+| **Port** | The scanner's serial port. The list shows the ports found; you can also type one. Usually `/dev/ttyACM0`. On **Network** this box is **Address**: the SDS200's IP address. |
+| **Baud** | Serial speed. Leave it at **115200**. Hidden on **Network**. |
 | **Polling** | How often the scanner's status is read, from 250 to 5000 ms (default **500 ms**). Shorter catches short transmissions sooner; longer puts less load on the connection. Changes take effect at once, even while connected. |
 | **Push updates** | The scanner sends its status by itself at the polling interval (`PSI`) instead of being asked each time (`GSI`): less traffic and fewer missed short transmissions. Off by default. |
 | **CONNECT** | Connects, or disconnects when connected. |
@@ -166,13 +169,13 @@ The top of the main window has the connection controls:
 2. If the scanner asks how to connect to the PC, choose the **serial port** mode, not mass storage. In mass storage mode the scanner shows up as a drive, and there's no serial port to connect to.
 3. Choose the port and click **CONNECT**.
 
-When connected, the status bar shows the scanner's model and firmware version, for example *Scanner: SDS100 • firmware …*. If the device doesn't call itself an SDS100, the status bar says so.
+When connected, the status bar shows the scanner's model and firmware version, for example *Scanner: SDS100 • firmware …*. If the device doesn't call itself an SDS100, SDS150 or SDS200, the status bar says so.
 
 ### Automatic reconnect
 
 With **Reconnect automatically** ticked, the program notices when:
 
-- the cable is unplugged,
+- the cable is unplugged (or, on the network, the scanner can't be reached),
 - the scanner is turned off or restarted, or
 - the scanner stops answering for 15 seconds.
 
@@ -181,6 +184,24 @@ It then keeps trying to reconnect, waiting 5 s, then 10 s, and up to 30 s betwee
 - Clicking **DISCONNECT** yourself never starts a reconnect.
 - A manual CONNECT that fails shows an error dialog. Automatic attempts report errors in the status bar instead, so dialogs don't pile up.
 - With reconnect turned off, a scanner that stops answering gives a warning in the status bar.
+
+### Connecting an SDS200 over the network
+
+The SDS200 has a network (Ethernet) port as well as USB, and the program can use either. The SDS100 and SDS150 connect by USB only.
+
+1. Connect the SDS200 to your network and note its IP address from the scanner's network settings. A fixed address, or a reservation in your router, saves typing it again after the router restarts.
+2. Set **Link** to **Network (SDS200)**. The Port box becomes **Address**, and Baud is hidden.
+3. Type the IP address, for example `192.168.1.50`. Add `:port` only if your scanner doesn't use the usual UDP port 50536.
+4. Click **CONNECT**. The status line shows *Contacting …*, then **CONNECTED** once the scanner answers.
+
+Everything then works as over USB: the information panel, keypad, waterfall, push updates, Discovery, Analyze, the scanner menu and the rest. To record the scanner's audio without a cable, see chapter 9.
+
+- The program waits up to 3 seconds for the scanner to answer. A wrong address, a scanner that is off, or a firewall that blocks UDP gives *No answer from …*.
+- **Reconnect automatically** works the same way as with USB: if the scanner stops answering for 15 seconds, or doesn't answer when contacted, the program keeps trying.
+- The USB port and the network address are kept separately, so you can switch **Link** back and forth without typing either again. Disconnect before changing **Link**.
+
+> [!NOTE]
+> Network support was added in version 1.1.89 and checked against a simulated SDS200, but not yet on a real one. If something doesn't work, please report it (chapter 23), with a Command Console log if you can (chapter 28).
 
 ### Push updates
 
@@ -200,7 +221,6 @@ Commands still waiting to be sent when you disconnect or close the program are s
 The main window holds four panels. By default they're tabs along the bottom of the window:
 
 ![The main window: SDS100 Keypad, Scanner Control, Scanner Information and Live Monitor.](images/main-window.png)
-
 
 | Panel | Contents |
 |---|---|
@@ -229,7 +249,7 @@ Most tools open in their own window rather than as a panel: the waterfall, the S
 |---|---|
 | **History** | Browse CSV archives…, Activity Charts…, Unit ID Log…, Unit Profile…, Audio Recordings…, Search Everything… (Ctrl+F), Fleet Map…, Incidents…, Daily Report…, Unit Name Suggestions… |
 | **View** | Transcription…, the four panels, Detach/Dock for each panel, Scanner Screen…, Waterfall…, Scanner Tools…, Return all panels to tabs, Theme |
-| **Tools** | Analyze…, Custom Search… (chapter 13), Antenna Test…; **Scanner ▸** Scanner Screen…, Scanner Menu…, Scanner Tools…, Command Console…; **Alerts ▸** Activity Watch…, Phone Alerts…, Send Calls to Rdio Scanner… (chapter 9); **Maps ▸** GPS…, Places and Map…, Aircraft (ADS-B)… (chapter 26); Ten Codes…; **Plasma Widget ▸** Share Scanner Information with the Widget, How to Add the Widget… (chapter 5); **Macro Keypad ▸** Macro Keypad… |
+| **Tools** | Analyze…, Custom Search… (chapter 13), Antenna Test…; **Scanner ▸** Scanner Screen…, Scanner Menu…, Scanner Tools…, Command Console…; **Alerts ▸** Activity Watch…, Alert Sounds…, Phone Alerts…, Send Calls to Rdio Scanner… (chapter 9); **Maps ▸** GPS…, Places and Map…, Aircraft (ADS-B)… (chapter 26); Ten Codes…; **Plasma Widget ▸** Share Scanner Information with the Widget, How to Add the Widget… (chapter 5); **Macro Keypad ▸** Macro Keypad…; Back Up Settings and Data…, Restore Settings and Data… (chapter 27) |
 | **Discovery** | Discovery Control…, Load Sessions, Start Last Session, Exit Discovery (Resume Scan) |
 | **Close Call** | Close Call Hits…, Mode: Off / Priority / Do Not Disturb, Check Current Mode, Start Close Call Only, Resume Scan, Close Call Bands…, Close Call Settings on Scanner… |
 | **Modes** | Weather and Tone-Out…, Weather (Weather Scan; Weather Alert: Alert Only, SAME 1–5 with their names, All FIPS; Weather Alert Priority; Check Weather Alert Priority; Name SAME Groups…), Start Tone-Out, Scanner Recordings…, Resume Scan (chapter 20) |
@@ -267,7 +287,6 @@ The status bar along the bottom shows messages, the scanner's model and firmware
 ### Right-click menus
 
 Almost every table and value has a right-click menu. Common items are **Copy**, **Hold on this**, **Alert when this is active**, **Name This Unit…**, **Play Recording** and **Search Everything for…**. When in doubt, right-click.
-
 
 ## 5. Live monitoring and reception history
 
@@ -380,7 +399,6 @@ Each file has the columns Start, End, Duration (s), System, Department, Channel,
 
 ![History → Browse History Archives…](images/archive-browser.png)
 
-
 ## 6. Controlling the scanner
 
 ### Scanner Control panel
@@ -458,7 +476,6 @@ Right-click a key → **Keypress Protocol Diagnostic** opens an experimental too
 
 ![Tools → Scanner → Scanner Screen…: a live copy of the scanner's display, with its keys.](images/scanner-screen.png)
 
-
 - It shows every text line, large and small lines, highlighted and underlined characters, and the scanner's colour mode (colour, black or white background).
 - The **alert LED** is shown as a coloured dot under the screen. The status line says when the scanner is in a menu, direct entry or waterfall mode.
 - Keys under the screen: SOFT 1–3, MENU, knob ◀ / PUSH / ▶, FUNC, ./NO, E/YES, AVOID and REPLAY. You can work through the scanner's menus from the PC while watching the result.
@@ -513,7 +530,6 @@ The window reopens at start-up if it was open when you quit. If the scanner refu
 
 ![Scanner Tools → Lists: the Favorites Lists, with monitor state and quick keys.](images/tools-lists.png)
 
-
 Right-click any system, department, site, channel or talkgroup to:
 - **hold** on it;
 - **temporarily avoid** or **permanently avoid** it (asks first);
@@ -539,20 +555,17 @@ Favorites list, system and department **quick keys** are shown as grids of butto
 
 ![Scanner Tools → Quick Keys.](images/tools-quick-keys.png)
 
-
 ### Service Types
 
 The 30 preset and 10 custom **service types** as checkboxes. **READ** them from the scanner, change them, then **APPLY**. **ALL ON** and **ALL OFF** are shortcuts.
 
 ![Scanner Tools → Service Types.](images/tools-service-types.png)
 
-
 ### Location
 
 Read and set the scanner's **latitude, longitude and range** (`LCR`). The scanner must be read first, so the program can send changes in the same number format; it reads back to confirm.
 
 ![Scanner Tools → Location (the position is blurred here).](images/tools-location.png)
-
 
 **Saved places** store locations by name. Double-click a saved place to send it to the scanner. Saved places also count as landmarks for Places and Map (chapter 17).
 
@@ -563,7 +576,6 @@ To keep the location updated automatically as you move, use GPS (chapter 17).
 Alert rules raise a **desktop notification** and a **sound** when a matching reception happens. Examples:
 
 ![Scanner Tools → Alerts (rule texts blurred).](images/tools-alerts.png)
-
 
 - *Channel* is *Sheriff East Dispatch*
 - *Talkgroup* is *TGID:44002*
@@ -579,7 +591,7 @@ Quick ways to add a rule:
 - right-click a unit → **Alert When This Unit Is Heard**;
 - right-click a call in Transcription → **Alert When Transcript Contains…**.
 
-Unit rules with "is exactly" match on the unit number, so they keep working after you name the unit. To send alerts to your phone as well, see Phone Alerts in chapter 12.
+Unit rules with "is exactly" match on the unit number, so they keep working after you name the unit. **SOUNDS…**, beside the Sound box, chooses what each kind of alert plays (Alert Sounds, chapter 12). To send alerts to your phone as well, see Phone Alerts in chapter 12.
 
 ### Working with SDS-Manager
 
@@ -596,7 +608,6 @@ The Monitor only reads SDS-Manager's shared file (`~/.local/share/sds100-databas
 **View → Waterfall…** opens the waterfall in its own window, which can be moved, resized and maximized. The live graph is on the left and takes any extra space. The controls are in a column on the right, with a draggable divider between them. The window reopens at start-up if it was open when you quit.
 
 ![The waterfall window with the live graph.](images/waterfall.png)
-
 
 ### Starting the waterfall
 
@@ -629,14 +640,13 @@ Frequencies outside the SDS100's coverage are rejected before anything is sent.
 
 In Night mode (chapter 19) the waterfall uses a black-to-red colour scale.
 
-
 ## 9. PC audio capture and recordings
 
 PC audio capture records the scanner's audio through your PC's sound input and saves **each transmission as its own MP3**, tagged with the reception details. Audio between transmissions is never saved.
 
 ### Setup
 
-1. Connect the SDS100's **headphone jack** to the PC's **line-in** or a **USB sound card**. The scanner's USB port carries only the serial connection, not audio.
+1. Connect the SDS100's **headphone jack** to the PC's **line-in** or a **USB sound card**. The scanner's USB port carries only the serial connection, not audio. (An SDS200 on the network needs no cable: see *SDS200 network audio* below.)
 2. Make sure `python3-pyqt6.qtmultimedia` and `ffmpeg` are installed (chapter 2). If either is missing, the panel says which.
 3. In **SCANNER CONTROL → PC AUDIO CAPTURE**, choose the input.
 4. Set the level. The level meter works even without a scanner connection. Adjust the scanner's volume so speech peaks at about **−12 to −3 dBFS**.
@@ -659,9 +669,26 @@ A recording starts and ends with the same receptions that go into reception hist
   The panel shows why a reception was skipped.
 - A transmission in progress when you close the program is saved before it exits.
 
-**SETTINGS…** in the panel sets pre-roll, post-roll, minimum length, MP3 bitrate (default 48k), mono and silence level.
+**SETTINGS…** in the panel sets pre-roll, post-roll, minimum length, MP3 bitrate (default 48k), mono and silence level, and the SDS200 network audio settings below.
 
 While a transmission is being recorded, the status bar shows a green ● **PC AUDIO**.
+
+### SDS200 network audio
+
+An SDS200 on the network sends its own audio as an RTSP stream, so no audio cable to the PC is needed. In **PC AUDIO CAPTURE**, choose **SDS200 network audio (RTSP)** as the **INPUT** (it's the last entry), then tick **Record each transmission**. The program uses the address in **Link → Network (SDS200)** (chapter 3), and `ffmpeg` receives the stream. Recordings, transcription and Rdio Scanner work as with a sound card.
+
+**SETTINGS…** has three settings for it, under *SDS200 network audio*:
+
+| Setting | What it does |
+|---|---|
+| **Extra delay** | The stream reaches the PC a little after the scanner reports the call, so recording carries on this much longer (default 1 s). Raise it if the last words are cut off. |
+| **Transport** | **Automatic** tries UDP, then TCP. Choose **TCP** if the audio breaks up. |
+| **Stream** | The stream's name on the scanner, normally `au:scanner.au`. |
+
+If the stream drops, or sends nothing for 10 seconds, the program starts it again by itself (5, 10 … 30 seconds apart) and the panel says so. Connecting to a different address moves the stream to it.
+
+> [!CAUTION]
+> The PC must be able to reach the scanner on UDP port 50536 (control) and port 554 (RTSP audio). A firewall on the PC, such as ufw, can block the replies.
 
 ### Files and tags
 
@@ -750,7 +777,6 @@ List the names and words your agencies use, such as unit names, station names, s
 
 ### The Transcription window
 
-
 ![View → Transcription…, with ten codes decoded.](images/transcription.png)
 
 - The list shows time, channel, talkgroup, units (with your names), length and transcript.
@@ -782,7 +808,6 @@ The SDS100 reports a P25 or DMR radio's **unit ID** (UID) number, but not the na
 Every unit heard is logged, one row each time a different unit transmits:
 
 ![History → Unit ID Log…](images/unit-id-log.png)
-
 
 `~/SDS100Monitor/unit_ids/unit_ids_YYYY-MM-DD.csv`
 
@@ -828,7 +853,6 @@ Double-click a unit in the Unit ID Log, or use **History → Unit Profile…** a
 
 ![Unit Name Suggestions from call signs heard in transcripts.](images/unit-suggestions.png)
 
-
 - When a radio is the only one on a transcribed call, and the speaker starts with a call sign (*"Engine 12 on scene"*, *"Dispatch, Medic 4 en route"*, *"Engine one two available"*), that counts as a vote for that radio's name.
 - A suggestion needs **2 votes** and **60%** of the radio's call-sign calls. **High** confidence is 4 or more votes and 80% or more.
 - A radio that gives several different call signs is marked *probably a dispatcher or a shared radio* and gets no suggestion.
@@ -846,7 +870,6 @@ The lower list shows the calls behind a suggestion; double-click one to listen. 
 **History → Fleet Map…** sketches which agency, unit type or shift each radio belongs to, from the unit ID log for the last 7, 30 or 90 days, or everything.
 
 ![Fleet Map: radios grouped by talkgroup and ID block.](images/fleet-map.png)
-
 
 - **Fleets:** a radio's fleet is the talkgroup it keys up on most. Each fleet shows how many radios it has, its keyups, its **active hours** (the hours holding 90% of its traffic, such as 07–15), other talkgroups it uses, when it was last heard, and the first word of its named radios (e.g. *Engine*).
 - **ID blocks:** within a fleet, radios are grouped into blocks of nearby ID numbers (within 100, adjustable). Blocks with different active hours often mean different shifts or units. For example, IDs 20100–20107 might be active 07–15 and 20500–20505 active 15–06.
@@ -892,7 +915,6 @@ The period can be the last 7, 30, 90 or 365 days, or all history. You can filter
 
 ![Incidents (headlines and places blurred).](images/incidents.png)
 
-
 **How calls are joined:**
 - Two calls belong together when the same radio is in both, up to **10 minutes** apart (adjustable).
 - They also belong together when they follow each other on a talkgroup within 30 seconds and a field unit is in one of them (dispatch, then a unit answering).
@@ -904,7 +926,7 @@ The period can be the last 7, 30, 90 or 365 days, or all history. You can filter
 
 The window lists which radios it treated as dispatch.
 
-**The incident list** shows start, length, calls, a **headline**, units, talkgroups, notes (such as *units moved to Fireground 2* or *more than one agency*) and what was said (the first transcribed call, usually the dispatch).
+**The incident list** shows start, length, **on scene** (minutes until the first unit said it was on scene), **type**, calls, a **headline**, units, talkgroups, notes (such as *units moved to Fireground 2*, *more than one agency* or *changed by you*) and what was said (the first transcribed call, usually the dispatch).
 
 **Headlines** sum an incident up in one line, for example *10-50B Motor vehicle accident — B. Personal injury — Wade Hampton at Pleasantburg — Engine 12, Medic 4 — 7 min*:
 - **what happened:** the first ten code in the calls that isn't routine (routine means codes such as *in service*, *en route* or *on scene*, chapter 21), otherwise the start of what was said, otherwise the talkgroups;
@@ -912,7 +934,48 @@ The window lists which radios it treated as dispatch.
 - **who:** up to three units, with your names;
 - **how long.**
 
-Select an incident to see its timeline: time, +minutes, talkgroup, units, length, the **ten codes** decoded in each call, and the transcript. Below the timeline are the **places** mentioned in the incident's calls; **SHOW PLACES ON MAP** opens the map on them, even for an older day. Double-click a call to play it, and right-click for unit names and profiles. Search covers headlines, words said, talkgroups and units. **EXPORT INCIDENT…** saves an incident as text or CSV, with its headline and codes. Today's incidents refresh every minute.
+Select an incident to see **what happened, step by step**, and its timeline.
+
+The step-by-step summary is worked out from the calls' ten codes and words, without AI:
+- how it started: the talkgroup and the first words said;
+- moves to other talkgroups or systems;
+- when each unit was **en route**, **on scene**, **transporting** and **back in service**, from the first call it is in that says so (on scene also shows the minutes since the start);
+- the last call, and one sentence such as *24 min, 12 calls, 3 units; first on scene after 6 min (Engine 12)*.
+
+Every field radio in a call gets that call's step, so a call where two units talk can credit both.
+
+The timeline shows time, +minutes, talkgroup, units, length, the **ten codes** decoded in each call, and the transcript. Below the timeline are the **places** mentioned in the incident's calls; **SHOW PLACES ON MAP** opens the map on them, even for an older day. Double-click a call to play it, and right-click for unit names and profiles. Search covers headlines, words said, talkgroups and units. **EXPORT INCIDENT…** saves an incident as text or CSV, with its headline, step-by-step summary and codes. Today's incidents refresh every minute.
+
+**Fixing incidents.** Calls are joined automatically, so now and then two incidents run together or one is split. Right-click to fix it:
+
+| Right-click on | Choice | What it does |
+|---|---|---|
+| An incident | **Edit Headline…** | Your own headline. Leave it empty to go back to the automatic one. |
+| An incident | **Merge with Another Incident…** | Joins two incidents; the ones nearest in time are listed first. |
+| An incident | **Hide (Not an Incident)** | Hides it here, in Search Everything and in the daily report. **Show hidden** lists hidden incidents again, with **Show Again**. |
+| An incident | **Undo My Changes to This Incident** | Puts it back as it was worked out, including calls taken out and splits next to it. |
+| A call in the timeline | **Take This Call Out of the Incident** | The call joins no incident. |
+| A call in the timeline | **Start a New Incident from This Call** | Splits the incident: this call and the ones after it become a new incident. |
+
+- Fixes are kept for each day in `~/SDS100Monitor/incident_edits.json`, by each call's start time and channel, so they stay when the incidents are worked out again.
+- An incident you changed is kept even with fewer calls than **At least … calls**, and its notes say *changed by you*.
+- Your fixes are used everywhere incidents appear, including the daily report.
+
+**Types.** Each incident is *Fire*, *EMS*, *Law*, *Traffic*, *Weather / hazard* or *Other*, worked out from words, without AI:
+- what was said and the meanings of the ten codes count twice, for example *structure fire*, *patient*, *shots fired*, *MVC* or *tree down*;
+- department and channel names count once, for example *Fire Dispatch*, *EMS 1* or *Sheriff Ops*;
+- unit call signs such as *Engine 12* or *Medic 4* don't count, because they turn up on every kind of call;
+- on a tie, Traffic comes first (a crash brings fire and EMS too), then Fire, Law and EMS.
+
+The **Type** column is coloured by type. The list beside Search shows one type only, and the line above the list counts them (*By type: 3 fire, 2 EMS*). Right-click → **Set Type** chooses it yourself, or **Automatic** goes back; it is kept with your other fixes.
+
+**Notes.** Right-click an incident → **Note…** to write your own note. It shows under the headline, in the **Notes** column, in **EXPORT INCIDENT…** and in the daily report, and Search finds it. **Undo My Changes to This Incident** leaves your note alone.
+
+**Alert when an incident grows.** Tick **Alert when an incident going on now reaches [5] units or more than one agency** above the list. Today's incidents are then worked out every two minutes in the background, with your fixes, and you get an alert such as *Incident growing: 6 units — 14:02 Structure fire — 100 Main St — Engine 12, Ladder 3, Medic 4 +3 — 18 min*.
+- Only incidents still going alert: one with a call in the last 10 minutes.
+- Each incident alerts once for the number of units and once for more than one agency, even if it later merges with another.
+- Hidden incidents never alert.
+- Choose its sound in **Alert Sounds** (*Incidents: an incident grows*). To get it on your phone, tick it in **Phone Alerts**; it is off there to begin with.
 
 > [!NOTE]
 > Calls with no unit ID (analog calls, or calls that ended before the ID arrived) only join an incident when they answer a unit within 30 seconds. So incidents work best on P25 and DMR systems.
@@ -936,6 +999,36 @@ Ignored talkgroups give no unusual-activity or new-talkgroup alerts, and are gre
 
 Activity alerts use the Alerts settings (desktop notification, sound) and appear in **Recent alerts**.
 
+### Alert Sounds
+
+**Tools → Alerts → Alert Sounds…** (also **SOUNDS…** in Scanner Tools → Alerts) chooses the sound for each kind of desktop alert, all on one page:
+
+| Alert | Comes from |
+|---|---|
+| **Activity Watch** (unusual activity, new talkgroup, new radio, radio back after a quiet spell) | Activity Watch, above |
+| **Tone-Out** | Tones detected in Tone-Out mode (chapter 20) |
+| **Weather Alert** | An alert in a Weather Alert mode: SAME 1–5 or All FIPS (chapter 20) |
+| **Close Call** | A new or watched Close Call frequency (chapter 14) |
+| **Aircraft (ADS-B)** | Emergency squawks and watched aircraft (chapter 26) |
+| **Keyword alerts** | Transcript rules in Scanner Tools → Alerts |
+| **Incidents: an incident grows** | More units or agencies in an incident going on now (History → Incidents…) |
+| **Other alert rules** | Channel, talkgroup, unit and other rules; also the Alerts **TEST** button |
+
+For each alert, choose under **Sound**:
+- one of the system's sounds: every sound theme installed in `/usr/share/sounds` (such as KDE's Ocean and freedesktop), and your own in `~/.local/share/sounds`;
+- **Sound file**: a file of your own, `.wav`, `.ogg`, `.oga`, `.flac` or `.mp3`. Type its path or choose it with **…**;
+- **None (silent)**: the alert still shows on screen and goes to your phone.
+
+**Volume** (0–100%) is set for each alert, and **TEST** plays it the way the alert would. Changes are kept straight away.
+- **USE ONE SOUND FOR ALL…** copies one alert's sound and volume to every other alert.
+- **RESET TO DEFAULTS** puts every alert back to the system's message sound at full volume, the sound every alert played before version 1.1.85. Until you change anything, that's what every alert plays.
+- **Play a sound with alerts**, at the top, is the same switch as the Sound box in Scanner Tools → Alerts. Untick it and every alert is silent; TEST still plays.
+
+Sounds are played by `paplay` (PulseAudio or PipeWire), `pw-play` or `ffplay`, whichever can play the file. MP3 files go to `ffplay`, which comes with `ffmpeg`. If a chosen file or theme sound is missing, the system's message sound plays instead and the status bar says why. With none of the players installed, the desktop beep is used. When several alerts of one kind arrive together, the sound isn't restarted on top of itself.
+
+> [!TIP]
+> Give the alerts you never want to miss, such as Tone-Out and Weather Alert, a sound that stands out, and turn the busy ones (new radios, radios back) down or to None.
+
 ### Phone Alerts
 
 **Tools → Alerts → Phone Alerts…** (also **PHONE ALERTS…** in Activity Watch and Alerts) sends alerts to your phone as **push notifications**.
@@ -952,7 +1045,7 @@ Choose a service:
 | **Telegram** | Bot token from @BotFather. Send your bot `/start`, then **FIND CHAT ID** fills in the chat ID. |
 | **Email** | Any SMTP server. For Gmail: `smtp.gmail.com`, port 587, STARTTLS and an app password. |
 
-**What goes to the phone:** unusual activity, new talkgroups and keyword alerts are on by default. New radios, returning radios, Close Call alerts, **Aircraft** (emergency squawks and watched aircraft, chapter 26) and other alert rules can be added.
+**What goes to the phone:** unusual activity, new talkgroups and keyword alerts are on by default. New radios, returning radios, Close Call alerts, **Aircraft** (emergency squawks and watched aircraft, chapter 26), **an incident grows** (above) and other alert rules can be added.
 
 **Limits:** no more than **20 an hour** (adjustable), and optional **quiet hours** such as 22:00 to 07:00. Alerts still show on the PC during quiet hours and over the limit.
 
@@ -961,13 +1054,11 @@ Choose a service:
 > [!CAUTION]
 > Settings, including tokens and passwords, are stored in the program's settings file in your home folder (`~/.config/SDS100Monitor/`).
 
-
 ## 13. Discovery and Custom Search
 
 The SDS100's **Discovery** mode looks for active frequencies (Conventional Discovery) or talkgroups (Trunk Discovery) in a range or system. You set up sessions on the scanner; SDS100 Monitor starts them, follows what they find, and logs the hits.
 
 ![The Discovery window.](images/discovery.png)
-
 
 ### The Discovery menu
 
@@ -1108,7 +1199,6 @@ Signal (S), decode quality (Q) and activity (A) as bars from 0 to 100, with syst
 
 ![Analyze → System Status.](images/analyze-status.png)
 
-
 #### Site health over time
 
 While System Status runs, S, Q and A are averaged over an interval and drawn on a graph, along with the **lowest Q** in each interval.
@@ -1127,7 +1217,6 @@ While System Status runs, S, Q and A are averaged over an interval and drawn on 
 Every channel of the site, updated 5 times a second, with the columns LCN, frequency, type (control channel, talkgroup, patch, I-call…), talkgroup, talkgroup name (from your reception history), unit ID (with your name for it), mode (analog, digital, encrypted), system ID, site ID, **On air** (how long the current call has lasted) and **Last call**.
 
 ![Analyze → Current Activity, with channel load.](images/analyze-activity.png)
-
 
 | Row colour | Meaning |
 |---|---|
@@ -1157,7 +1246,6 @@ Decoded **control-channel messages**, with the scanner's time stamp, the message
 
 ![Analyze → Activity Log.](images/analyze-log.png)
 
-
 - **Save to ~/SDS100Monitor/activity_log** writes a daily CSV with PC time, scanner time, system, site, data, message and details.
 - **Show sync broadcasts:** P25 synchronization (time) broadcasts arrive several times a second and carry only the time. The SDS100 labels them *"Add Harris Patch ID"*. They're hidden and not saved unless this is ticked; the count beside it shows how many were hidden.
 - Lines the scanner sends twice are dropped. **Filter**, **CLEAR** and **OPEN FOLDER** are at the top.
@@ -1179,7 +1267,6 @@ LCN Finder doesn't work on P25 systems, which send their own channel numbers; th
 The **Found IDs** tab collects every **talkgroup** and **unit** seen in Current Activity and the Activity Log, including ones you don't scan. It is filled in while either of those runs, and kept between sessions.
 
 ![Analyze → Found IDs.](images/analyze-found-ids.png)
-
 
 Columns: kind, ID, status, name, transmissions, first seen, last seen, **seen with** (the units a talkgroup was heard with, or the talkgroups a unit used), and notes (encrypted, patched with…, or the scanner showing the type as *Unknown*).
 
@@ -1232,7 +1319,6 @@ On the **Run** tab:
 
 ![Antenna Test → Run.](images/antenna-run.png)
 
-
 The scanner goes back to scanning at the end (optional). Every run is saved to `~/SDS100Monitor/antenna_tests` as it happens, including a stopped run or one cut off by a disconnect.
 
 **Waterfall noise-floor snapshot:** with the scanner in waterfall mode on a band, **CAPTURE SNAPSHOT** averages 20 frames and adds them to the run. Use the same centre, span and RF gain for every antenna. Levels are the scanner's raw waterfall units, not dBm.
@@ -1242,7 +1328,6 @@ The scanner goes back to scanning at the end (optional). Every run is saved to `
 On the **Compare** tab, tick the runs to compare.
 
 ![Antenna Test → Compare.](images/antenna-compare.png)
-
 
 - Each reference gets a row per measure, with the difference from the oldest ticked run and a **Best** column.
 - A difference only counts when it's bigger than about 2 dB (RSSI), 5 points (Q or S) or 20% (counts). Otherwise the result says *≈ no clear difference*.
@@ -1283,7 +1368,6 @@ The **GPS** indicator in the status bar is green with a fix, amber while waiting
 
 ![The map in the browser, with the places heard in the last 24 hours (the list is blurred).](images/places-map.png)
 
-
 **What's found:**
 - addresses (*400 Main Street*, *1234 N. Elm Ave*, *200 block of Smith Lane*);
 - intersections (*Main and 5th*, *Route 40 at Oak Ridge Road*, *corner of Potomac Street and Franklin Street*);
@@ -1317,7 +1401,6 @@ Saved places from Scanner Tools → Location count automatically. Right-click a 
 Map tiles come from openstreetmap.org (© OpenStreetMap contributors). Places and Map needs transcription, and an internet connection for lookups and tiles.
 
 Places are saved in `~/SDS100Monitor/places/places_YYYY-MM-DD.csv`.
-
 
 ## 18. Macro keypad
 
@@ -1390,7 +1473,6 @@ When you press a keypad key, the window highlights its row and shows what was se
 
 ![View → Theme: mode, accent and text size.](images/themes.png)
 
-
 ### Mode
 
 | Mode | Description |
@@ -1423,7 +1505,6 @@ When you press a keypad key, the window highlights its row and shows what was se
 The **Modes** menu runs two of the scanner's special modes from the PC, with alerts, and plays the recordings stored on the scanner. **Modes → Weather and Tone-Out…** opens a window with both modes and the alerts heard.
 
 ![Modes → Weather and Tone-Out…](images/weather-toneout.png)
-
 
 ### Weather Alert
 
@@ -1480,8 +1561,6 @@ Your location comes from the GPS (chapter 17), then the scanner's own location s
 
 The top line shows your location and the agency last heard.
 
-
-
 - **Show:**
   - *Best match here* lists each code once, from the best list.
   - *All lists that apply here* shows every applicable list's meaning side by side, the best in bold.
@@ -1499,7 +1578,9 @@ The top line shows your location and the agency last heard.
 - **IMPORT CSV…** and **EXPORT CSV…** use the columns Code, Meaning, Details.
 - **RESTORE BUILT-IN LISTS** puts back the lists that came with the program, as they came.
 
-The program comes with the **APCO standard (1974)** ten signals, which applies anywhere. Add your local agencies' codes as your own lists. They're kept in `~/SDS100Monitor/ten_codes.json`.
+The program comes with the **APCO standard (1974)** ten signals, which applies anywhere.
+
+Add your local agencies' codes as your own lists. They're kept in `~/SDS100Monitor/ten_codes.json`.
 
 ### Decoding in transcripts
 
@@ -1514,11 +1595,12 @@ The Transcription window decodes codes heard in calls (chapter 10). It recognise
 
 ![History → Daily Report…](images/daily-report.png)
 
-
-- **Summary:** receptions, time on air, first and last call, the busiest hour, systems, radios heard (and how many are new), incidents, transcribed calls, and Weather/Tone-Out alerts.
+- **Summary:** receptions, time on air, first and last call, the busiest hour, systems, radios heard (and how many are new), listening time, traffic compared with normal, incidents, the median time to first unit on scene, transcribed calls, and Weather/Tone-Out alerts.
 - **Activity by hour**, as a bar chart.
+- **Compared with normal**, when anything stands out: talkgroups much busier than usual (at least 10 calls and twice the usual), or much quieter (half the usual or less, where at least 20 are usual).
 - **Busiest talkgroups and channels**, with calls and time on air.
-- **Incidents**, each with its headline (chapter 12).
+- **Incidents**, each with its type, headline, time to first unit on scene and your note (chapter 12), with the count by type in the summary. Hidden incidents are left out, and your own headlines and types are used.
+- **Alerts**: every alert the Monitor gave that day (unusual activity, new talkgroups and radios, Close Call, aircraft, keywords, alert rules and growing incidents), counted by kind, with the last 40 listed. Every alert is also written to `~/SDS100Monitor/alerts/` for this.
 - **Ten codes heard**, with how often.
 - **Most active radios**, and **radios not heard in the previous 30 days**.
 - **Places mentioned**, linked to OpenStreetMap.
@@ -1528,8 +1610,12 @@ Choose the day at the top. **SAVE PDF…** and **SAVE HTML…** save the report 
 
 **Automatic reports:** tick **PDF**, **HTML** or both under *Save each finished day's report automatically as*. After midnight each finished day's report is saved to `~/SDS100Monitor/reports/daily_report_YYYY-MM-DD.pdf` (or `.html`). If the program was closed for a while, it catches up on the last 7 days. **OPEN REPORTS FOLDER** shows them.
 
+**Listening** is how long the Monitor was reading the scanner that day, and when, for example *18 h 20 min (00:00–02:10, 06:05–23:59)*. The Monitor notes each minute it reads the scanner in `~/SDS100Monitor/coverage/`, so a quiet day can be told from a day it was off. Days before version 1.1.87 have no record; the report then says in how many hours calls were heard.
+
+**Compared with normal** counts the calls in the hours the Monitor was listening (hours with at least 30 minutes of listening) and compares them with the same number of hours on the previous 28 days, for example *busier than usual: 1,240 calls in the hours listened to, usually about 980*. It needs 5 days of history first.
+
 > [!NOTE]
-> Incidents and ten codes are worked out automatically, so the report can be wrong in the details. It says so at the bottom of the page.
+> Incidents, ten codes and times on scene are worked out automatically, so the report can be wrong in the details. It says so at the bottom of the page. Fix incidents in History → Incidents… and make the report again.
 
 ## 23. Updates, About and the project page
 
@@ -1551,13 +1637,13 @@ The program also checks quietly 20 seconds after it starts. If there's an update
 
 ## 24. Testing the program
 
-SDS100 Monitor comes with its own automated tests, about 100 of them, which check that its parts still work: the windows, the connection, push updates against a simulated scanner, the battery reading, reception logging, transcripts, Weather and Tone-Out alerts, GPS, alerts and search, themes, ten codes, reports, the update check and the install scripts. To run them:
+SDS100 Monitor comes with its own automated tests, nearly 300 of them, which check that its parts still work: the windows, the connection, push updates against a simulated scanner, the SDS200 network connection against a simulated SDS200, the battery reading, reception logging, transcripts, Weather and Tone-Out alerts, GPS, alerts and search, themes, ten codes, reports, the update check and the install scripts. To run them:
 
 `bash /opt/sds100-monitor/run_tests.sh`
 
 (or `bash run_tests.sh` in a folder install). It takes a few seconds. Add `-v` to list each test by name. It ends with **OK**, or lists what failed.
 
-- The tests never touch your real reception history, settings or scanner. Every test works in its own throw-away home folder, and no serial port is opened.
+- The tests never touch your real reception history, settings or scanner. Every test works in its own throw-away home folder, and no serial port is opened. The network tests talk to a simulated SDS200 on this PC (`127.0.0.1`) only.
 - Most tests run on a stand-in for Qt, so they run anywhere.
 - With PyQt6 installed (it is with the package), two more tests start the **real program on the real Qt**, invisibly. One triggers every menu command, opens every window and switches themes; the other starts and closes the program, and fails on any crash.
 
@@ -1588,9 +1674,9 @@ Use **Raspberry Pi OS 64-bit, with desktop** (Bookworm or newer), on a good micr
 
    `sudo apt update && sudo apt full-upgrade`
 
-3. Download `sds100-monitor_<version>_all.deb` on the Pi (from the releases page in its web browser), and install it in a terminal, in the folder you downloaded it to:
+3. Download `sds100-monitor_<version>_all.deb` on the Pi (from the releases page in its web browser, or copy it over), and install it in a terminal, in the folder you downloaded it to:
 
-   `sudo apt install ./sds100-monitor_1.1.65_all.deb`
+   `sudo apt install ./sds100-monitor_1.1.89_all.deb`
 
    The package is the same one as for a PC: it's pure Python, marked *all* for every processor.
 
@@ -1635,7 +1721,6 @@ The Pi's desktop isn't KDE, so the **System** theme follows Qt's own light or da
 If you also run an ADS-B receiver on the same PC, with **readsb** or **dump1090** and an RTL-SDR dongle, the Monitor can read its aircraft list. It then alerts on emergency squawks and watched aircraft, and works out which aircraft go with the callsigns heard in airband transcripts. It works alongside tar1090 and graphs1090, which you don't need to change.
 
 ![Tools → Maps → Aircraft (ADS-B)…](images/aircraft.png)
-
 
 Open it with **Tools → Maps → Aircraft (ADS-B)…**.
 
@@ -1699,7 +1784,7 @@ Alerts and matches are saved in `~/SDS100Monitor/adsb/`, one file of each per da
 
 ## 27. Files and folders
 
-All data is kept in your home folder, mostly under `~/SDS100Monitor`. Everything is plain CSV, JSON or MP3, so it can be opened in a spreadsheet or other programs, and backed up by copying the folder.
+All data is kept in your home folder, mostly under `~/SDS100Monitor`. Everything is plain CSV, JSON or MP3, so it can be opened in a spreadsheet or other programs. To keep or move it, use **Tools → Back Up Settings and Data…** (next section), or copy the folder.
 
 | File or folder | Contents |
 |---|---|
@@ -1719,15 +1804,42 @@ All data is kept in your home folder, mostly under `~/SDS100Monitor`. Everything
 | `~/SDS100Monitor/geocode_cache.json` | Cached address lookups |
 | `~/SDS100Monitor/mode_alerts/mode_alerts_YYYY-MM-DD.csv` | Weather and Tone-Out alerts (chapter 20) |
 | `~/SDS100Monitor/ten_codes.json` | Your ten-code lists (chapter 21) |
+| `~/SDS100Monitor/incident_edits.json` | Your fixes, types and notes for incidents (chapter 12) |
+| `~/SDS100Monitor/alerts/alerts_YYYY-MM-DD.csv` | Every alert given, for the daily report (chapter 22) |
+| `~/SDS100Monitor/coverage/coverage_YYYY-MM-DD.csv` | The minutes the Monitor was reading the scanner (chapter 22) |
 | `~/SDS100Monitor/reports/` | Saved daily reports (chapter 22) |
 | `~/SDS100Monitor/rdio_queue.json` | Calls waiting to be sent to Rdio Scanner (chapter 9) |
 | `~/SDS100Monitor/adsb/adsb_alerts_YYYY-MM-DD.csv` | Aircraft squawk and watch-list alerts (chapter 26) |
 | `~/SDS100Monitor/adsb/aircraft_heard_YYYY-MM-DD.csv` | Callsigns matched in transcripts (chapter 26) |
+| `~/SDS100Monitor/backups/` | Backups made with Tools → Back Up Settings and Data…, and *Before restore* copies |
+| `~/SDS100Monitor/sounds/` | Your own alert sounds, when a restore put them here |
 | `~/.config/SDS100Monitor/` | Program settings: window layout, options, alert rules, theme, phone alerts, update check |
 | `/opt/sds100-monitor/` | The installed program (package); `/usr/bin/sds100-monitor` starts it |
 | `~/SDS100Monitor-<version>/` | A folder install (older versions, or without the package) |
 
 Existing CSV files are never rewritten in a new format. New features add new files instead of changing old ones.
+
+### Back up and restore
+
+**Tools → Back Up Settings and Data…** puts the Monitor's settings and data in one .zip file, to set the Monitor up again after a reinstall or on another computer. Tick what goes in; each line shows how many files and how much space:
+- **Settings:** every setting (alerts and alert sounds, phone alerts, Rdio Scanner, the keypad, the connection and network address, windows and the rest), with unit names, the information panel, ten codes, Close Call notes, your fixes to incidents and your own alert sound files.
+- **History and logs:** receptions, unit IDs, activity, site health, channel load, listening time, places, aircraft, antenna tests and reports.
+- **Recordings:** recorded audio. Not ticked to begin with, because it can be large.
+
+Press **BACK UP…** and choose where to save it: `~/SDS100Monitor/backups` is offered, or pick a USB stick to take it to another computer. The transcription engine isn't included; install it again with **INSTALL ENGINE** (chapter 10).
+
+> [!CAUTION]
+> A backup holds your settings as they are, including the passwords and tokens for phone alerts and Rdio Scanner. Keep it somewhere private.
+
+**Tools → Restore Settings and Data…** puts a backup back:
+1. Choose the backup. The window shows when it was made and by which version, and the parts it holds.
+2. Tick the parts to restore. The line below says how many files will be added, replaced, or are already the same.
+3. Press **RESTORE AND RESTART**. The Monitor closes, saving everything as usual, restores the files, and starts again. It then says what was restored.
+
+- Files in the backup replace the ones here with the same name; everything else stays.
+- Anything replaced is saved first in `~/SDS100Monitor/backups` as *Before restore …zip*. Restore that to undo the restore.
+- On another computer, your own alert sounds are put in `~/SDS100Monitor/sounds` if they aren't where they were, and settings that pointed into the old data folder point into the new one.
+- Every file is checked against the backup's own checksums, and nothing outside the data folder and the settings file is written. A damaged or unknown backup is refused.
 
 ## 28. Troubleshooting
 
@@ -1740,6 +1852,8 @@ Existing CSV files are never rewritten in a new format. New features add new fil
 **The program says another program has the port open.** Close the other program (for example Sentinel under Wine, a terminal program, or a second copy of SDS100 Monitor). Only one program can use the scanner's port at a time.
 
 **The connection keeps dropping.** Try another USB port or cable, and avoid unpowered hubs. With **Reconnect automatically** ticked, the program reconnects by itself, even if the port name changes.
+
+**SDS200 on the network: *No answer from …*.** Check the address on the scanner, that the PC and the scanner are on the same network, and that UDP port 50536 isn't blocked by a firewall on the PC. Try `ping` with the scanner's address first.
 
 ### Scanner functions
 
@@ -1759,12 +1873,19 @@ Existing CSV files are never rewritten in a new format. New features add new fil
 
 ### Audio and transcription
 
+**An alert makes no sound, or only a beep.**
+- Check that **Play a sound with alerts** is ticked in **Tools → Alerts → Alert Sounds…**, and that the alert's sound isn't None or its volume 0%.
+- Press **TEST** on that alert. The line under the list says what happened, for example that a file wasn't found.
+- A beep means none of `paplay`, `pw-play` or `ffplay` is installed: `sudo apt install pulseaudio-utils` (or `ffmpeg` for MP3 files).
+
 **PC audio capture records nothing.**
 - Check the input chosen in PC AUDIO CAPTURE.
 - Check the level meter while the scanner is receiving; the scanner's volume must be up.
 - Check the skip reason shown in the panel: too short, or below the silence level.
 
 **Recordings are distorted.** Lower the scanner's volume until speech peaks around −12 to −3 dBFS.
+
+**SDS200 network audio: no sound, or the endings are cut off.** Try **Transport: TCP** in SETTINGS…, then raise **Extra delay**. To check the stream on its own, open `rtsp://<address>:554/au:scanner.au` in VLC. The audio needs `ffmpeg` (`sudo apt install ffmpeg`).
 
 **Transcription doesn't start.** Install `python3-venv`, then use **INSTALL ENGINE** in Transcription → SETTINGS…. The first call after installing or changing model waits for the model to download.
 

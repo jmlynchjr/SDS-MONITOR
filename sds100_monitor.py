@@ -10,6 +10,7 @@ Command Specification.
 import bisect
 import csv
 import fcntl
+import hashlib
 import hmac
 import json
 import math
@@ -27,6 +28,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timedelta
 from array import array
 from collections import Counter, defaultdict, deque
@@ -34,7 +36,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.1.84"
+VERSION = "1.1.89"
 
 # Qt 6.10's new PipeWire audio backend can crash the program while it lists audio devices at
 # start (segmentation fault inside PipeWire, seen with Qt 6.10.2 / PipeWire 1.6.2; it also prints
@@ -760,6 +762,143 @@ def find_scanner_port(preferred):
     return preferred
 
 
+# ---- SDS200 network connection (v1.1.89) -------------------------------------
+# The SDS200 takes the same remote commands over its Ethernet port as over USB,
+# as UDP datagrams on port 50536, and streams its audio over RTSP. The SDS100
+# and SDS150 have no network port.
+SCANNER_UDP_PORT = 50536
+SCANNER_RTSP_PATH = "au:scanner.au"
+CONNECTION_LINKS = (("usb", "USB"), ("lan", "Network (SDS200)"))
+NETWORK_AUDIO_LABEL = "SDS200 network audio (RTSP)"
+
+
+def parse_lan_address(text, default_port=SCANNER_UDP_PORT):
+    """'192.168.1.50' or '192.168.1.50:50536' (or a host name) → (host, port).
+    Raises ValueError with a readable reason."""
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("Enter the SDS200's IP address (shown on the scanner under "
+                         "Settings → Network / LAN).")
+    host, port = text, default_port
+    if text.count(":") == 1:
+        host, _, port_text = text.partition(":")
+        try:
+            port = int(port_text)
+        except ValueError:
+            raise ValueError(f"'{port_text}' is not a port number.") from None
+    host = host.strip()
+    if not host or any(c.isspace() for c in host) or "/" in host:
+        raise ValueError(f"'{text}' is not an IP address or host name.")
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Port {port} is out of range (1–65535).")
+    return host, port
+
+
+def rtsp_url(host, path=SCANNER_RTSP_PATH):
+    """The SDS200 audio stream for an address typed in the Monitor."""
+    host = parse_lan_address(host)[0]
+    return f"rtsp://{host}:554/{path.lstrip('/')}"
+
+
+class UdpScannerLink:
+    """The SDS200's network port, used like the serial port by ScannerThread.
+
+    Every command goes out as its own datagram (several commands written at once,
+    e.g. "KAL\\rPSI,500\\r", are split). Replies are joined into one byte stream in
+    arrival order, so ScannerThread.consume() splits them exactly as it does USB
+    data; long XML replies come in parts with <Footer No=.. EOT=..>, already
+    handled. Opening checks that the scanner answers, so a wrong address or a
+    scanner that is off gives an error (and automatic reconnect) instead of a
+    connection that never shows anything.
+    """
+    def __init__(self, host, port=SCANNER_UDP_PORT, timeout=0.1, answer_wait=3.0, sock=None):
+        import socket
+        self.host, self.port, self.timeout = host, int(port), timeout
+        self.pending = bytearray()
+        self.sock = sock
+        if self.sock is None:
+            try:
+                infos = socket.getaddrinfo(host, self.port, 0, socket.SOCK_DGRAM)
+            except OSError as exc:
+                raise OSError(f"Can't find {host}: {exc}") from None
+            family, _type, _proto, _name, address = infos[0]
+            self.sock = socket.socket(family, socket.SOCK_DGRAM)
+            try:
+                self.sock.connect(address)      # replies only from the scanner
+            except OSError:
+                self.sock.close()
+                raise
+        self.sock.setblocking(False)
+        if answer_wait:
+            self.handshake(answer_wait)
+
+    def handshake(self, wait):
+        deadline = time.monotonic() + wait
+        next_try = 0.0
+        while time.monotonic() < deadline:
+            if time.monotonic() >= next_try:
+                self.write(b"MDL\r")             # resent each second: UDP can drop it
+                next_try = time.monotonic() + 1.0
+            data = self.read(65536, 0.2)
+            if data:
+                self.pending[:0] = data          # keep the answer for the Monitor
+                return
+        self.close()
+        raise OSError(f"No answer from {self.host} port {self.port}. Check the address, "
+                      "that the SDS200 is on and connected to the network, and that a "
+                      "firewall isn't blocking UDP.")
+
+    # The part of the pyserial interface ScannerThread uses.
+    def write(self, data):
+        for part in bytes(data).split(b"\r"):
+            if part:
+                try:
+                    self.sock.send(part + b"\r")
+                except BlockingIOError:
+                    time.sleep(0.01)
+                    self.sock.send(part + b"\r")
+                except ConnectionRefusedError:
+                    pass        # ICMP from an earlier datagram; the watchdog notices silence
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def reset_input_buffer(self):
+        self.pending.clear()
+
+    def read(self, size=4096, timeout=None):
+        """Everything that has arrived (waits up to timeout for the first datagram)."""
+        out = bytearray(self.pending)
+        self.pending.clear()
+        wait = self.timeout if timeout is None else timeout
+        if not out:
+            ready, _, _ = select.select([self.sock], [], [], wait)
+            if not ready:
+                return b""
+        while True:
+            try:
+                out += self.sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except ConnectionRefusedError:
+                break           # nothing listening (scanner restarting); keep going
+        return bytes(out)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
 # Digital decode shown in the status bar (GSI Property P25Status, spec V2.00).
 P25_STATUS_NAMES = {"Data": "data", "P25": "P25", "DMR": "DMR", "CAP": "Capacity Plus",
                     "CON": "Connect Plus", "DT3": "DMR Tier III", "XPT": "Hytera XPT",
@@ -778,9 +917,11 @@ class ScannerThread(QThread):
     analyze_received = pyqtSignal(str)  # AST XML block (Analyze data)
     menu_received = pyqtSignal(str)     # MSI XML block (scanner menu)
 
-    def __init__(self, port, baud, poll_ms):
+    def __init__(self, port, baud, poll_ms, link="usb"):
         super().__init__()
         self.port, self.baud, self.poll_ms = port, baud, poll_ms
+        # v1.1.89: "lan" = SDS200 over the network; port is then "host" or "host:port".
+        self.link = link
         self.running = True
         self.commands = queue.Queue()
         # Waterfall graph polling, switched on by the GUI while the scanner is
@@ -799,8 +940,19 @@ class ScannerThread(QThread):
         self.push_ms = 0
         self.last_status = 0.0
 
+    def open_device(self):
+        """The serial port, or the SDS200's network port (same interface)."""
+        if self.link == "lan":
+            host, port = parse_lan_address(self.port)
+            self.message.emit(f"Contacting {host} port {port}…")
+            return UdpScannerLink(host, port)
+        # exclusive=True takes a lock so a second program using pyserial
+        # (another SDS100 Monitor, the capture script) cannot open it too.
+        return serial.Serial(self.port, self.baud, timeout=0.1,
+                             write_timeout=1, exclusive=True)
+
     def run(self):
-        users = port_users(self.port)
+        users = port_users(self.port) if self.link != "lan" else []
         if users:
             self.message.emit(
                 f"ERROR: {self.port} is already open in another program:\n"
@@ -810,12 +962,9 @@ class ScannerThread(QThread):
             self.message.emit("DISCONNECTED")
             return
         try:
-            # exclusive=True takes a lock so a second program using pyserial
-            # (another SDS100 Monitor, the capture script) cannot open it too.
-            with serial.Serial(self.port, self.baud, timeout=0.1,
-                               write_timeout=1, exclusive=True) as device:
+            with self.open_device() as device:
                 self.message.emit("CONNECTED")
-                time.sleep(0.35)
+                time.sleep(0.35 if self.link != "lan" else 0.05)
                 device.reset_input_buffer()
                 for cmd in (b"MDL\r", b"VER\r"):
                     device.write(cmd)
@@ -894,7 +1043,7 @@ class ScannerThread(QThread):
                     device.write((cmd + "\r").encode("ascii"))
                     self.command_result.emit("SENT: " + cmd)
                 device.flush()
-        except (serial.SerialException, OSError) as exc:
+        except (serial.SerialException, OSError, ValueError) as exc:
             self.message.emit("ERROR: " + str(exc))
         finally:
             self.message.emit("DISCONNECTED")
@@ -3226,6 +3375,10 @@ class AlertsPanel(QWidget):
         self.sound_box = QCheckBox("Sound")
         row.addWidget(self.notify_box)
         row.addWidget(self.sound_box)
+        sounds = QPushButton("SOUNDS…")
+        sounds.setToolTip("Choose the sound for each kind of alert")
+        sounds.clicked.connect(lambda: AlertSoundsDialog(self.monitor, self).exec())
+        row.addWidget(sounds)
         row.addWidget(make_label("Repeat no more than every"))
         self.cooldown = QSpinBox()
         self.cooldown.setRange(0, 3600)
@@ -4604,6 +4757,7 @@ class AudioCapture(QObject):
     saved = pyqtSignal(str, list)      # file path, index row (from a worker thread)
     skipped = pyqtSignal(str)          # reason a reception wasn't saved
     failed = pyqtSignal(str)
+    notice = pyqtSignal(str)           # network audio: dropped / reconnecting / back (v1.1.89)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4628,10 +4782,96 @@ class AudioCapture(QObject):
         self.watchdog = QTimer(self)
         self.watchdog.setSingleShot(True)
         self.watchdog.timeout.connect(self.finalize)
+        # v1.1.89: SDS200 network audio. ffmpeg receives the scanner's RTSP stream and
+        # hands the Monitor raw 16-bit audio, which goes through the same cutting,
+        # MP3 saving and transcription as a PC sound input.
+        self.stream_url = None
+        self.stream_delay = 1.0        # extra post-roll: the stream lags the scanner's status
+        self.stream_transport = "auto"  # auto, udp or tcp
+        self.stream_path = SCANNER_RTSP_PATH
+        self.stream_restarts = 0
+        self.stream_last_data = 0.0
+        self.stream_stopping = False
+        self.stream_carry = b""
+        self.stream_timer = QTimer(self)
+        self.stream_timer.timeout.connect(self.check_stream)
 
     @property
     def running(self):
         return self.source is not None
+
+    @property
+    def streaming(self):
+        return self.stream_url is not None
+
+    @staticmethod
+    def stream_command(url, transport="auto", rate=8000):
+        """ffmpeg arguments that turn the scanner's RTSP audio into raw mono 16-bit PCM."""
+        # (Not "-fflags nobuffer": with it ffmpeg 6 can deliver no audio at all.)
+        cmd = ["-hide_banner", "-loglevel", "error", "-nostdin", "-flags", "low_delay"]
+        if transport in ("udp", "tcp"):
+            cmd += ["-rtsp_transport", transport]
+        cmd += ["-i", url, "-vn", "-ac", "1", "-ar", str(rate), "-f", "s16le", "pipe:1"]
+        return cmd
+
+    def start_stream(self, url):
+        """Record from the SDS200's network audio stream instead of a sound input."""
+        self.stop()
+        if shutil.which("ffmpeg") is None:
+            self.failed.emit("ffmpeg was not found; it is needed for network audio "
+                             "(sudo apt install ffmpeg).")
+            return False
+        self.fmt_name, self.rate, self.channels, self.frame = "s16le", 8000, 1, 2
+        self.bytes_per_sec = self.rate * self.frame
+        self.ring.clear()
+        self.ring_start = self.total = self.last_end = 0
+        self.stream_url = url
+        self.stream_restarts = 0
+        self.stream_stopping = False
+        self.launch_stream()
+        self.stream_timer.start(2000)
+        return True
+
+    def launch_stream(self):
+        if self.stream_url is None:
+            return
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        process.readyReadStandardOutput.connect(self.read)
+        process.finished.connect(lambda *_a, p=process: self.stream_ended(p))
+        self.source = self.io = process
+        self.stream_carry = b""
+        self.stream_last_data = time.monotonic()
+        process.start("ffmpeg", self.stream_command(self.stream_url, self.stream_transport))
+
+    def check_stream(self):
+        """Every 2 s: a stream that stops delivering for 10 s is started again."""
+        if self.stream_url is None or self.source is None:
+            return
+        if time.monotonic() - self.stream_last_data > 10:
+            self.notice.emit("No network audio for 10 s; reconnecting the stream…")
+            self.stream_last_data = time.monotonic()
+            self.source.kill()                 # stream_ended() starts it again
+
+    def stream_ended(self, process):
+        if process is not self.source:
+            return                             # an old process, already replaced
+        error = ""
+        try:
+            error = bytes(process.readAllStandardError().data()).decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        if self.current is not None:
+            self.read()
+        self.source = self.io = None
+        process.deleteLater()
+        if self.stream_stopping or self.stream_url is None:
+            return
+        self.stream_restarts += 1
+        delay = min(30, 5 * self.stream_restarts)
+        detail = error.splitlines()[-1] if error else "the stream ended"
+        self.notice.emit(f"Network audio stopped ({detail}); trying again in {delay} s…")
+        QTimer.singleShot(delay * 1000, self.launch_stream)
 
     def start(self, device):
         self.stop()
@@ -4674,6 +4914,16 @@ class AudioCapture(QObject):
         if self.current is not None:
             self.read()
             self.finalize()
+        if self.stream_url is not None:
+            self.stream_stopping = True
+            self.stream_url = None
+            self.stream_timer.stop()
+            if self.source is not None:
+                process = self.source
+                self.source = self.io = None
+                process.kill()
+                process.waitForFinished(1000)
+                process.deleteLater()
         if self.source is not None:
             self.source.stop()
             self.source.deleteLater()
@@ -4689,6 +4939,16 @@ class AudioCapture(QObject):
         data = self.io.readAll().data()
         if not data:
             return
+        if self.stream_url is not None:
+            if self.stream_restarts and time.monotonic() - self.stream_last_data > 3:
+                self.notice.emit("Network audio is back.")
+            self.stream_last_data = time.monotonic()
+            self.stream_restarts = 0
+            data = self.stream_carry + data    # a pipe read can end mid-sample
+            usable = self.align(len(data))
+            data, self.stream_carry = data[:usable], data[usable:]
+            if not data:
+                return
         self.total += len(data)
         self.ring += data
         keep = self.align(self.bytes_per_sec * 6)
@@ -4727,9 +4987,10 @@ class AudioCapture(QObject):
         if self.current is None:
             return
         self.current["meta"] = meta
-        self.current["stop_at"] = self.total + self.align(self.postroll * self.bytes_per_sec)
+        tail = self.postroll + (self.stream_delay if self.stream_url is not None else 0.0)
+        self.current["stop_at"] = self.total + self.align(tail * self.bytes_per_sec)
         # If the input stops delivering audio, still finish the file.
-        self.watchdog.start(int(self.postroll * 1000) + 1500)
+        self.watchdog.start(int(tail * 1000) + 1500)
 
     def finalize(self):
         self.watchdog.stop()
@@ -4887,6 +5148,26 @@ class AudioSettingsDialog(QDialog):
         form.addRow("", self.mono)
         form.addRow(self.silence_on)
         form.addRow("Silence below", self.silence)
+        # v1.1.89: SDS200 network audio (INPUT → SDS200 network audio).
+        heading = make_label("SDS200 NETWORK AUDIO")
+        set_css(heading, "font-weight:700; padding-top:8px;")
+        form.addRow(heading)
+        self.stream_delay = seconds(capture.stream_delay, 0, 5,
+            "The network stream reaches the PC a little after the scanner reports the "
+            "reception, so recording carries on this much longer to catch the last words.")
+        self.stream_transport = QComboBox()
+        for key, label in (("auto", "Automatic"), ("udp", "UDP"), ("tcp", "TCP")):
+            self.stream_transport.addItem(label, key)
+        self.stream_transport.setCurrentIndex(
+            max(0, self.stream_transport.findData(capture.stream_transport)))
+        self.stream_transport.setToolTip("How the audio travels (RTSP). Automatic tries UDP, "
+                                         "then TCP; choose TCP if the audio breaks up.")
+        self.stream_path = QLineEdit(capture.stream_path)
+        self.stream_path.setToolTip(f"The stream's name on the scanner (normally "
+                                    f"{SCANNER_RTSP_PATH}).")
+        form.addRow("Extra delay", self.stream_delay)
+        form.addRow("Transport", self.stream_transport)
+        form.addRow("Stream", self.stream_path)
         note = make_label(f"Recordings are saved in {AUDIO_DIR}/YYYY-MM-DD/, "
                       "with a recordings_YYYY-MM-DD.csv index for each day.")
         note.setWordWrap(True)
@@ -4905,6 +5186,9 @@ class AudioSettingsDialog(QDialog):
         capture.bitrate = self.bitrate.currentText()
         capture.mono = self.mono.isChecked()
         capture.silence_dbfs = float(self.silence.value()) if self.silence_on.isChecked() else None
+        capture.stream_delay = self.stream_delay.value()
+        capture.stream_transport = self.stream_transport.currentData() or "auto"
+        capture.stream_path = self.stream_path.text().strip() or SCANNER_RTSP_PATH
 
 
 class AudioRecordings(QWidget):
@@ -10465,13 +10749,101 @@ def find_hubs(recs, unit_names=None, partners_needed=6, window=60, share_needed=
     return hubs
 
 
-def build_incidents(recs, hubs, gap=600, exchange=30, min_calls=3):
+# -- Your own fixes to incidents (v1.1.87) --------------------------------------------------------
+#
+# Incidents are worked out again from the history each time, so a fix is kept as what you did, by call:
+# a call taken out, two calls joined (merge), a call that starts a new incident (split), an incident hidden,
+# and your own headline. A call is known by its start time and channel, which never change.
+
+INCIDENT_EDITS_FILE = DATA_DIR / "incident_edits.json"
+
+
+def call_id(r):
+    return f"{r['row'][0]}|{r['channel']}"
+
+
+def empty_incident_edits():
+    return {"removed": [], "joins": [], "splits": [], "hidden": [], "headlines": {}, "types": {}, "notes": {}}
+
+
+def clean_incident_edits(data):
+    e = empty_incident_edits()
+    if not isinstance(data, dict):
+        return e
+    for key in ("removed", "splits", "hidden"):
+        e[key] = [str(x) for x in data.get(key, []) if isinstance(x, str)] if isinstance(data.get(key), list) else []
+    if isinstance(data.get("joins"), list):
+        e["joins"] = [[str(a), str(b)] for a, b in (j for j in data["joins"]
+                                                  if isinstance(j, list) and len(j) == 2)]
+    if isinstance(data.get("headlines"), dict):
+        e["headlines"] = {str(k): str(v) for k, v in data["headlines"].items() if str(v).strip()}
+    if isinstance(data.get("types"), dict):                                     # v1.1.88
+        e["types"] = {str(k): str(v) for k, v in data["types"].items() if v in INCIDENT_TYPE_LABELS}
+    if isinstance(data.get("notes"), dict):
+        e["notes"] = {str(k): str(v) for k, v in data["notes"].items() if str(v).strip()}
+    return e
+
+
+def load_incident_edits(day, path=None):
+    try:
+        data = json.loads(Path(path or INCIDENT_EDITS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    return clean_incident_edits(data.get(day) if isinstance(data, dict) else None)
+
+
+def save_incident_edits(day, edits, path=None):
+    path = Path(path or INCIDENT_EDITS_FILE)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    edits = clean_incident_edits(edits)
+    if any(edits.values()):
+        data[day] = edits
+    else:
+        data.pop(day, None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=1, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def forget_incident_edits(edits, inc, gap=600):
+    """Undo your fixes to one incident: its joins, hiding, headline and type, and the splits and calls taken
+    out around it (between its start and end, give or take `gap` seconds), so either half of a split undoes it.
+    Your note stays."""
+    ids = set(inc["ids"])
+    lo, hi = inc["start"] - timedelta(seconds=gap), inc["end"] + timedelta(seconds=gap)
+
+    def inside(cid):
+        t = parse_stamp(cid.split("|", 1)[0])
+        return t is not None and lo <= t <= hi
+    edits["joins"] = [j for j in edits["joins"] if not (set(j) & ids)]
+    edits["splits"] = [c for c in edits["splits"] if c not in ids and not inside(c)]
+    edits["hidden"] = [c for c in edits["hidden"] if c not in ids]
+    edits["headlines"] = {k: v for k, v in edits["headlines"].items() if k not in ids}
+    edits["types"] = {k: v for k, v in edits["types"].items() if k not in ids}
+    edits["removed"] = [c for c in edits["removed"] if not inside(c)]
+    return edits
+
+
+def build_incidents(recs, hubs, gap=600, exchange=30, min_calls=3, edits=None):
     """Join a day's receptions into incidents.
 
     Two receptions belong together when the same (non-dispatch) radio is in
     both, no more than `gap` seconds apart, or when they follow each other on
     the same talkgroup within `exchange` seconds and a field unit is in one of
-    them (a dispatcher and a unit answering each other)."""
+    them (a dispatcher and a unit answering each other).
+
+    `edits` (v1.1.87, load_incident_edits) are your own fixes, applied after: calls taken out, merges,
+    splits, hidden incidents and headlines. An incident you changed is kept even below `min_calls`."""
+    edits = clean_incident_edits(edits)
+    removed = set(edits["removed"])
+    ids = [call_id(r) for r in recs]
+    index = {cid: i for i, cid in enumerate(ids)}
     n = len(recs)
     parent = list(range(n))
 
@@ -10489,6 +10861,8 @@ def build_incidents(recs, hubs, gap=600, exchange=30, min_calls=3):
     by_unit = defaultdict(list)
     by_key = defaultdict(list)
     for i, r in enumerate(recs):
+        if ids[i] in removed:
+            continue
         by_key[r["key"]].append(i)
         for u in r["units"]:
             if u not in hubs:
@@ -10502,21 +10876,61 @@ def build_incidents(recs, hubs, gap=600, exchange=30, min_calls=3):
             field = any(u not in hubs for u in recs[a]["units"] + recs[b]["units"])
             if field and (recs[b]["start"] - recs[a]["end"]).total_seconds() <= exchange:
                 union(a, b)
+    touched = set()
+    for a, b in edits["joins"]:
+        if a in index and b in index and a not in removed and b not in removed:
+            union(index[a], index[b])
+            touched.add(a)
     groups = defaultdict(list)
     for i in range(n):
-        groups[find(i)].append(recs[i])
-    incidents = []
+        if ids[i] not in removed:
+            groups[find(i)].append(i)
+    splits = set(edits["splits"])
+    pieces = []
     for members in groups.values():
+        members.sort(key=lambda i: recs[i]["start"])
+        piece = []
+        for i in members:
+            if piece and ids[i] in splits:
+                touched.add(ids[piece[0]])             # the part before the split changed too
+                pieces.append(piece)
+                piece = []
+                touched.add(ids[i])
+            piece.append(i)
+        pieces.append(piece)
+    hidden = set(edits["hidden"])
+    incidents = []
+    for piece in pieces:
+        members = [recs[i] for i in piece]
+        member_ids = [ids[i] for i in piece]
+        changed = bool(touched & set(member_ids)) or any(c in splits for c in member_ids)
         field_units = []
         for r in members:
             for u in r["units"]:
                 if u not in hubs and u not in field_units:
                     field_units.append(u)
-        if len(members) < min_calls or not field_units:
+        if not changed and (len(members) < min_calls or not field_units):
             continue
-        incidents.append(make_incident(members, hubs, field_units))
+        inc = make_incident(members, hubs, field_units)
+        inc["ids"] = [call_id(r) for r in inc["members"]]
+        inc["hidden"] = any(c in hidden for c in inc["ids"])
+        own = next((edits["headlines"][c] for c in inc["ids"] if c in edits["headlines"]), "")
+        inc["headline_override"] = own
+        inc["type_override"] = next((edits["types"][c] for c in inc["ids"] if c in edits["types"]), "")
+        inc["note"] = "\n".join(edits["notes"][c] for c in inc["ids"] if c in edits["notes"])
+        inc["edited"] = (changed or bool(own) or bool(inc["type_override"]) or inc["hidden"]
+                         or any(_near(c, inc, gap) for c in removed))
+        if inc["edited"]:
+            inc["flags"].append("changed by you")
+        incidents.append(inc)
     incidents.sort(key=lambda inc: inc["start"], reverse=True)
     return incidents
+
+
+def _near(cid, inc, gap):
+    """A call (by id) within an incident's time, give or take `gap` seconds."""
+    t = parse_stamp(cid.split("|", 1)[0])
+    return t is not None and inc["start"] - timedelta(seconds=gap) <= t <= inc["end"] + timedelta(seconds=gap)
 
 
 def make_incident(members, hubs, field_units):
@@ -10966,6 +11380,279 @@ def incident_places(inc, place_rows):
     return found
 
 
+# -- What happened, step by step, and response times (v1.1.87) -------------------------------------
+#
+# Worked out from the calls' ten codes and transcripts, without AI: a unit is "en route", "on scene",
+# "transporting" or back "in service" from the first call it is in that says so. Every field radio in that
+# call gets the step, so a call where two units talk can credit both.
+
+UNIT_STEPS = (                     # checked in this order; the first that matches a call is its step
+    ("on_scene", "on scene", r"\b(on scene|on-scene|on location|at (the )?scene|arrived|arriving on scene)\b"),
+    ("transport", "transporting", r"\b(transport(ing)?|en ?route to (the )?hospital)\b"),
+    ("en_route", "en route", r"\b(en ?route|in route|responding)\b"),
+    ("clear", "back in service", r"\b(in service|available|clear(ed|ing)? (the )?scene|back in quarters|"
+                                 r"returning to (quarters|station))\b"),
+)
+
+
+def call_step(text, codes=()):
+    """The step a call reports (a key of UNIT_STEPS), from its transcript and decoded codes."""
+    said = " ".join([str(text or "")] + [str(m) for _raw, _c, m, _l in codes]).casefold()
+    said = re.sub(r"<[^>]+>", " ", said)
+    for key, _label, pattern in UNIT_STEPS:
+        if re.search(pattern, said):
+            return key
+    return ""
+
+
+def incident_story(inc, member_codes, hubs=(), unit_title=uid_label):
+    """{lines [(time, text)], units {unit: {step: time}}, first_on_scene (seconds), first_unit, sentence}."""
+    labels = {key: label for key, label, _p in UNIT_STEPS}
+    members = inc["members"]
+    start = inc["start"]
+    units = {}
+    lines = []
+    if not members:
+        return {"lines": [], "units": {}, "first_on_scene": None, "first_unit": "", "sentence": ""}
+    first = members[0]
+    opening = f"Started on {first['label']}"
+    if first.get("text"):
+        said = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", first["text"])).strip()
+        opening += f": “{said[:80].rstrip()}{'…' if len(said) > 80 else ''}”"
+    lines.append((first["start"], opening))
+    seen_tg, seen_system = {first["label"]}, {first["system"]}
+    for r, codes in zip(members, member_codes):
+        if r["label"] not in seen_tg:
+            seen_tg.add(r["label"])
+            where = r["label"] + (f" ({r['system']})" if r["system"] not in seen_system else "")
+            lines.append((r["start"], f"Moved to {where}"))
+            seen_system.add(r["system"])
+        step = call_step(r.get("text"), codes)
+        if not step:
+            continue
+        for u in r["units"]:
+            if u in hubs:
+                continue
+            done = units.setdefault(u, {})
+            if step in done:
+                continue
+            done[step] = r["start"]
+            text = f"{unit_title(u)} {labels[step]}"
+            if step == "on_scene":
+                text += f" (+{(r['start'] - start).total_seconds() / 60:.0f} min)"
+            lines.append((r["start"], text))
+    on_scene = [(t, u) for u, steps in units.items() for k, t in steps.items() if k == "on_scene"]
+    first_on_scene, first_unit = None, ""
+    if on_scene:
+        t, u = min(on_scene)
+        first_on_scene, first_unit = (t - start).total_seconds(), u
+    lines.append((inc["end"], "Last call"))
+    lines.sort(key=lambda line: line[0])
+    minutes = (inc["end"] - start).total_seconds() / 60
+    sentence = (f"{minutes:.0f} min, {len(members)} calls, {len(inc['units'])} "
+                f"unit{'s' if len(inc['units']) != 1 else ''}")
+    if first_on_scene is not None:
+        sentence += f"; first on scene after {first_on_scene / 60:.0f} min ({unit_title(first_unit)})"
+    sentence += "."
+    return {"lines": lines, "units": units, "first_on_scene": first_on_scene, "first_unit": first_unit,
+            "sentence": sentence}
+
+
+# -- Incident types (v1.1.88) ----------------------------------------------------------------------
+#
+# Worked out from words, not AI: the calls' transcripts and decoded ten codes count twice, the names of
+# the departments and channels once. The type with most points wins; none gives "other". You can set the
+# type yourself (right-click → Set Type), and that is kept with your other fixes.
+
+INCIDENT_TYPES = [   # key, label, colour in the window (theme key), colour in reports (white page)
+    ("fire", "Fire", "#ff9e91", "#a8432f"),
+    ("ems", "EMS", "#8bd6f2", "#2167b1"),
+    ("law", "Law", "#b48cf0", "#7654a6"),
+    ("traffic", "Traffic", "#ffcf7a", "#a87d15"),
+    ("hazard", "Weather / hazard", "#7ee3a5", "#1b8a5a"),
+    ("other", "Other", "#c9d6e6", "#536779"),
+]
+INCIDENT_TYPE_LABELS = {key: label for key, label, _c, _p in INCIDENT_TYPES}
+INCIDENT_TYPE_WORDS = {
+    "fire": r"\b(fire|fires|smoke|flames?|fire alarm|brush|structure|hazmat|gas leak|odor of gas)\b",
+    "ems": r"\b(patients?|unresponsive|breathing|cardiac|chest pains?|overdose|fall|injur(y|ed|ies)|"
+           r"bleeding|seizure|stroke|transport(ing)?|hospital)\b",
+    "law": r"\b(police|sheriff|deputy|deputies|trooper|highway patrol|suspects?|shots?|domestic|theft|burglary|"
+           r"warrant|pursuit|traffic stop|armed|assault|disturbance|larceny|robbery|shoplift(ing|er)?)\b",
+    "traffic": r"\b(mvc|mva|motor vehicle|accident|collision|crash|wreck|rollover|disabled vehicle|"
+               r"road blocked|vehicle (in|into|off) the)\b",
+    "hazard": r"\b(tree down|trees? (in|across) the road|wires? down|power lines?|flood(ing|ed)?|storm|"
+              r"tornado|weather|debris in the road)\b",
+}
+# Department and channel names: the service as well (a call on "Fire Dispatch" leans fire). Unit call signs
+# (Engine 12, Medic 4) are left out of what was said, because every type of call has them.
+INCIDENT_SERVICE_WORDS = {
+    "fire": r"\b(fire|fd|fireground|engine|ladder|tanker)\b",
+    "ems": r"\b(ems|medic|medical|ambulance|rescue)\b",
+    "law": r"\b(police|pd|sheriff|so|law|patrol|troop)\b",
+}
+
+
+def incident_type(inc, member_codes=()):
+    """The likely type of an incident (a key of INCIDENT_TYPE_LABELS)."""
+    points = Counter()
+    names = {r.get("department", "") for r in inc["members"]} | {r.get("channel", "") for r in inc["members"]}
+    for name in names:
+        n = str(name).casefold()
+        for key in INCIDENT_TYPE_LABELS:
+            pattern = "|".join(p for p in (INCIDENT_TYPE_WORDS.get(key), INCIDENT_SERVICE_WORDS.get(key)) if p)
+            if pattern and re.search(pattern, n):
+                points[key] += 1
+    codes_by_call = list(member_codes) + [[]] * (len(inc["members"]) - len(member_codes))
+    for r, codes in zip(inc["members"], codes_by_call):
+        said = re.sub(r"<[^>]+>", " ", " ".join([str(r.get("text") or "")]
+                                                 + [str(m) for _raw, _c, m, _l in codes])).casefold()
+        for key, pattern in INCIDENT_TYPE_WORDS.items():
+            points[key] += 2 * len(re.findall(pattern, said))
+    points = +points                                   # drop the types with no points
+    if not points:
+        return "other"
+    # On a tie: a crash brings fire and EMS too, and a fire or a crime often has a patient.
+    order = ["traffic", "fire", "law", "ems", "hazard", "other"]
+    return max(points, key=lambda k: (points[k], -order.index(k)))
+
+
+def incident_type_counts(incidents):
+    """'3 fire, 2 EMS, 1 other' for incidents with summaries."""
+    counts = Counter(i["summary"]["type"] for i in incidents)
+    return ", ".join(f"{counts[k]} {label if k == 'ems' else label.lower()}"
+                     for k, label, _c, _p in INCIDENT_TYPES if counts[k])
+
+
+# -- Growing incidents (v1.1.88) -------------------------------------------------------------------
+
+def incident_growth(incidents, alerted, now, min_units=5, agencies=True, recent=600):
+    """[(incident, reason key, reason text)] for incidents still going (a call in the last `recent`
+    seconds) that reached `min_units` field units or more than one agency, and haven't had that alert.
+    `alerted` holds (reason, call id) for incidents already alerted; none of an incident's calls may be
+    in it, so an incident that grows by merging with another isn't alerted twice."""
+    found = []
+    for inc in incidents:
+        if inc.get("hidden") or (now - inc["end"]).total_seconds() > recent:
+            continue
+        reasons = []
+        if min_units and len(inc["units"]) >= min_units:
+            reasons.append(("units", f"{len(inc['units'])} units"))
+        if agencies and "more than one agency" in inc["flags"]:
+            reasons.append(("agencies", "more than one agency"))
+        for key, text in reasons:
+            if not any((key, c) in alerted for c in inc["ids"]):
+                found.append((inc, key, text))
+    return found
+
+
+class IncidentWatch(QObject):
+    """Works out today's incidents every two minutes (in a worker thread) and alerts when one grows,
+    if switched on in the Incidents window."""
+    computed = pyqtSignal(object)
+
+    def __init__(self, monitor):
+        super().__init__(monitor)
+        self.monitor = monitor
+        self.alerted = set()
+        self.busy = False
+        self.previous = ("", [])                     # yesterday's receptions, read once a day
+        self.computed.connect(self.check)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(120000)
+
+    def enabled(self):
+        return str(self.monitor.settings.value("incidents/grow_alert", "false")).lower() == "true"
+
+    def options(self):
+        s = self.monitor.settings
+        return (int(s.value("incidents/grow_units", 5)),
+                str(s.value("incidents/grow_agencies", "true")).lower() == "true",
+                int(s.value("incidents/gap", 10)) * 60, int(s.value("incidents/min_calls", 3)))
+
+    def tick(self):
+        if not self.enabled() or self.busy:
+            return
+        self.busy = True
+        day = datetime.now().strftime("%Y-%m-%d")
+        _units, _agencies, gap, min_calls = self.options()
+        names = self.monitor.unit_names
+
+        def work():
+            try:
+                self.computed.emit(self.compute(day, gap, min_calls, names))
+            except Exception:                      # never let this stop monitoring
+                self.computed.emit([])
+        threading.Thread(target=work, daemon=True).start()
+
+    def compute(self, day, gap, min_calls, unit_names=None):
+        recs = receptions_with_units(day)
+        before = (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        if self.previous[0] != before:
+            self.previous = (before, receptions_with_units(before))
+        hubs = find_hubs(recs + self.previous[1], unit_names)
+        return build_incidents(recs, hubs, gap=gap, min_calls=min_calls, edits=load_incident_edits(day))
+
+    def check(self, incidents, now=None):
+        self.busy = False
+        units, agencies, _gap, _min = self.options()
+        for inc, key, text in incident_growth(incidents, self.alerted, now or datetime.now(), units, agencies):
+            for c in inc["ids"]:
+                self.alerted.add((key, c))
+            summary = summarize_incident(inc, self.monitor.ten_codes.decode, (), self.monitor.unit_title)
+            self.monitor.notify(f"Incident growing: {text}", f"{inc['start']:%H:%M} {summary['headline']}",
+                                "incident")
+
+
+# -- The alert log (v1.1.88) -----------------------------------------------------------------------
+#
+# Every alert the Monitor gives (notify) is also written to alerts/alerts_YYYY-MM-DD.csv, for the daily report.
+
+ALERT_LOG_DIR = DATA_DIR / "alerts"
+ALERT_LOG_HEADERS = ["Time", "Kind", "Title", "Text"]
+ALERT_KIND_LABELS = {"activity": "Unusual activity", "new_talkgroup": "New talkgroup",
+                     "new_unit": "New radio", "returning": "Radio back", "close_call": "Close Call",
+                     "tone_out": "Tone-Out", "wx_alert": "Weather alert", "aircraft": "Aircraft",
+                     "keyword": "Keyword", "incident": "Incident growing", "alert": "Alert rule"}
+
+
+def alert_log_path(day):
+    return ALERT_LOG_DIR / f"alerts_{day}.csv"
+
+
+def write_alert_log(category, title, text, now=None):
+    now = now or datetime.now()
+    try:
+        ALERT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = alert_log_path(now.strftime("%Y-%m-%d"))
+        fresh = not path.exists() or path.stat().st_size == 0
+        with path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if fresh:
+                w.writerow(ALERT_LOG_HEADERS)
+            w.writerow([now.strftime("%Y-%m-%d %H:%M:%S"), category, title, text])
+    except OSError:
+        pass
+
+
+def read_alert_log(day):
+    try:
+        with alert_log_path(day).open(newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return []
+    return [r for r in rows[1:] if len(r) == len(ALERT_LOG_HEADERS)]
+
+
+def median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
 def summarize_incident(inc, decode=None, place_rows=(), unit_title=uid_label):
     """{headline, codes [(code, meaning, times)], member_codes [per call], places [rows]}.
 
@@ -11003,9 +11690,20 @@ def summarize_incident(inc, decode=None, place_rows=(), unit_title=uid_label):
         parts.append(", ".join(names) + (f" +{more}" if more > 0 else ""))
     minutes = (inc["end"] - inc["start"]).total_seconds() / 60
     parts.append(f"{minutes:.0f} min")
-    return {"headline": " — ".join(parts),
+    story = incident_story(inc, member_codes, set(inc.get("hubs", [])), unit_title)
+    return {"headline": inc.get("headline_override") or " — ".join(parts),
+            "automatic_headline": " — ".join(parts),
             "codes": [(c, m, counts[(c, m)]) for c, m in sorted(order, key=order.get)],
-            "member_codes": member_codes, "places": places}
+            "member_codes": member_codes, "places": places, "story": story,
+            "type": inc.get("type_override") or incident_type(inc, member_codes),
+            "automatic_type": incident_type(inc, member_codes)}
+
+
+def incident_story_text(story):
+    """The step-by-step summary as lines of text, ending with the one-sentence summary."""
+    if not story or not story.get("lines"):
+        return ""
+    return "\n".join([f"{t:%H:%M}  {text}" for t, text in story["lines"]] + [story["sentence"]])
 
 
 class IncidentsWindow(QWidget):
@@ -11045,20 +11743,49 @@ class IncidentsWindow(QWidget):
         self.search.setPlaceholderText("Words said, talkgroup, unit…")
         self.search.textChanged.connect(self.fill)
         bar.addWidget(self.search, 1)
+        self.type_filter = QComboBox()
+        self.type_filter.addItem("All types", "")
+        for key, label, _c, _p in INCIDENT_TYPES:
+            self.type_filter.addItem(label, key)
+        self.type_filter.currentIndexChanged.connect(self.fill)
+        bar.addWidget(self.type_filter)
+        self.show_hidden = QCheckBox("Show hidden")
+        self.show_hidden.setToolTip("Incidents you hid with right-click → Hide (Not an Incident)")
+        self.show_hidden.toggled.connect(self.fill)
+        bar.addWidget(self.show_hidden)
         refresh = QPushButton("REFRESH")
         refresh.clicked.connect(self.reload)
         bar.addWidget(refresh)
         layout.addLayout(bar)
+        grow = QHBoxLayout()                       # v1.1.88: alert when an incident grows
+        self.grow_alert = QCheckBox("Alert when an incident going on now reaches")
+        self.grow_alert.setChecked(str(s.value("incidents/grow_alert", "false")).lower() == "true")
+        grow.addWidget(self.grow_alert)
+        self.grow_units = QSpinBox()
+        self.grow_units.setRange(2, 50)
+        self.grow_units.setSuffix(" units")
+        self.grow_units.setValue(int(s.value("incidents/grow_units", 5)))
+        grow.addWidget(self.grow_units)
+        self.grow_agencies = QCheckBox("or more than one agency")
+        self.grow_agencies.setChecked(str(s.value("incidents/grow_agencies", "true")).lower() == "true")
+        grow.addWidget(self.grow_agencies)
+        for w in (self.grow_alert, self.grow_agencies):
+            w.toggled.connect(self.grow_changed)
+        self.grow_units.valueChanged.connect(self.grow_changed)
+        grow.addWidget(make_label("(checked every 2 minutes; sound in Alert Sounds, phone in Phone Alerts)"))
+        grow.addStretch(1)
+        layout.addLayout(grow)
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         set_css(self.summary, "color:#a5bdd2;")
         layout.addWidget(self.summary)
         split = QSplitter(Qt.Orientation.Vertical)
-        self.table = unit_table(["Start", "Length", "Calls", "Headline", "Units", "Talkgroups", "Notes",
-                                 "What was said"])
+        self.table = unit_table(["Start", "Length", "On scene", "Type", "Calls", "Headline", "Units", "Talkgroups",
+                                 "Notes", "What was said"])
         stretch_last(self.table)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.itemSelectionChanged.connect(self.show_incident)
+        self.table.customContextMenuRequested.connect(self.incident_menu)
         split.addWidget(self.table)
         lower = QWidget()
         ll = QVBoxLayout(lower)
@@ -11067,6 +11794,10 @@ class IncidentsWindow(QWidget):
         self.detail.setWordWrap(True)
         set_css(self.detail, "font-weight:700;color:#8bd6f2;")
         ll.addWidget(self.detail)
+        self.story = make_label("")
+        self.story.setWordWrap(True)
+        self.story.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        ll.addWidget(self.story)
         self.timeline = unit_table(["Time", "+", "Talkgroup / channel", "Units", "Length", "Ten codes",
                                     "Transcript"])
         stretch_last(self.timeline)
@@ -11087,7 +11818,8 @@ class IncidentsWindow(QWidget):
         self.map_btn.clicked.connect(self.show_places)
         self.map_btn.setEnabled(False)
         row.addWidget(self.map_btn)
-        row.addWidget(make_label("Double-click a call to play its recording."))
+        row.addWidget(make_label("Double-click a call to play its recording. Right-click an incident or a "
+                                 "call to fix how calls were joined."))
         row.addStretch(1)
         ll.addLayout(row)
         split.addWidget(lower)
@@ -11105,6 +11837,12 @@ class IncidentsWindow(QWidget):
     def save_settings(self, settings):
         if self.geometry_restored:
             settings.setValue(self.geometry_key, self.saveGeometry())
+
+    def grow_changed(self, *_):
+        s = self.monitor.settings
+        s.setValue("incidents/grow_alert", "true" if self.grow_alert.isChecked() else "false")
+        s.setValue("incidents/grow_units", self.grow_units.value())
+        s.setValue("incidents/grow_agencies", "true" if self.grow_agencies.isChecked() else "false")
 
     def settings_changed(self, *_):
         self.monitor.settings.setValue("incidents/gap", self.gap.value())
@@ -11157,15 +11895,21 @@ class IncidentsWindow(QWidget):
             previous = ""
         hubs = find_hubs(recs + (receptions_with_units(previous) if previous else []),
                          self.monitor.unit_names)
+        self.hubs = hubs
+        self.edits = load_incident_edits(day) if day else empty_incident_edits()
         self.incidents = build_incidents(recs, hubs, gap=self.gap.value() * 60,
-                                         min_calls=self.min_calls.value())
+                                         min_calls=self.min_calls.value(), edits=self.edits)
         places = read_places(day) if day else []
         for inc in self.incidents:
             inc["summary"] = summarize_incident(inc, self.monitor.ten_codes.decode, places,
                                                 self.monitor.unit_title)
-        in_incidents = sum(len(i["members"]) for i in self.incidents)
+        shown = [i for i in self.incidents if not i["hidden"]]
+        in_incidents = sum(len(i["members"]) for i in shown)
+        hidden = len(self.incidents) - len(shown)
         hub_names = ", ".join(self.monitor.unit_title(h) for h in sorted(hubs)[:4])
-        set_text(self.summary, f"{len(self.incidents)} incidents from {len(recs):,} calls ({in_incidents:,} in incidents). "
+        types = incident_type_counts(shown)
+        set_text(self.summary, f"{len(shown)} incidents from {len(recs):,} calls ({in_incidents:,} in incidents)"
+            + (f", {hidden} hidden" if hidden else "") + ". " + (f"By type: {types}. " if types else "")
             + (f"Treated as dispatch (talk with many radios): {hub_names}"
                + ("…" if len(hubs) > 4 else "") + ". " if hubs else "")
             + "Calls join an incident through the radios in them, so receptions without a unit ID "
@@ -11177,8 +11921,14 @@ class IncidentsWindow(QWidget):
         selected = self.current()
         self.visible = []
         for inc in self.incidents:
+            if inc["hidden"] and not self.show_hidden.isChecked():
+                continue
+            wanted = self.type_filter.currentData()
+            if wanted and inc["summary"]["type"] != wanted:
+                continue
             if term:
-                hay = " ".join([inc["title"], inc["summary"]["headline"], " ".join(inc["talkgroups"])]
+                hay = " ".join([inc["title"], inc["summary"]["headline"], " ".join(inc["talkgroups"]),
+                                inc.get("note", ""), INCIDENT_TYPE_LABELS[inc["summary"]["type"]]]
                                + [self.monitor.unit_title(u) for u in inc["units"]]
                                + [r["text"] or "" for r in inc["members"]]).casefold()
                 if term not in hay:
@@ -11190,11 +11940,22 @@ class IncidentsWindow(QWidget):
             units = ", ".join(self.monitor.unit_title(u) for u in inc["units"][:4])
             if len(inc["units"]) > 4:
                 units += f" +{len(inc['units']) - 4}"
+            on_scene = inc["summary"]["story"]["first_on_scene"]
+            notes = (["hidden"] if inc["hidden"] else []) + inc["flags"] + (
+                ["note: " + inc["note"].replace("\n", " ")] if inc.get("note") else [])
             rows.append([inc["start"].strftime("%H:%M:%S"), f"{minutes:.0f} min",
+                         f"{on_scene / 60:.0f} min" if on_scene is not None else "",
+                         INCIDENT_TYPE_LABELS[inc["summary"]["type"]],
                          len(inc["members"]), inc["summary"]["headline"], units,
                          " → ".join(inc["talkgroups"][:4]),
-                         "; ".join(inc["flags"]), inc["title"] if inc["transcribed"] else ""])
-        fill_table(self.table, rows, numeric=(2,))
+                         "; ".join(notes), inc["title"] if inc["transcribed"] else ""])
+        fill_table(self.table, rows, numeric=(4,))
+        colours = {key: colour for key, _l, colour, _p in INCIDENT_TYPES}
+        for display_row in range(self.table.rowCount()):
+            index = table_row_index(self.table, display_row)
+            item = self.table.item(display_row, 3)
+            if item is not None and index is not None and index < len(self.visible):
+                item.setForeground(tc(colours[self.visible[index]["summary"]["type"]]))
         if selected is not None:
             for i, inc in enumerate(self.visible):
                 if inc["start"] == selected["start"]:
@@ -11214,6 +11975,7 @@ class IncidentsWindow(QWidget):
         inc = self.current()
         if inc is None:
             set_text(self.detail, "Select an incident to see its timeline.")
+            set_text(self.story, "")
             self.members = []
             fill_table(self.timeline, [])
             set_text(self.places_note, "")
@@ -11226,6 +11988,10 @@ class IncidentsWindow(QWidget):
             f"{len(inc['members'])} calls, {inc['air']:.0f} s on air • "
             f"{len(inc['units'])} units: " + ", ".join(self.monitor.unit_title(u) for u in inc["units"])
             + (" • " + "; ".join(inc["flags"]) if inc["flags"] else ""))
+        set_text(self.story, f"Type: {INCIDENT_TYPE_LABELS[summary['type']]}"
+                 + (" (set by you)" if inc.get("type_override") else "") + "\n"
+                 + (f"Note: {inc['note']}\n" if inc.get("note") else "")
+                 + incident_story_text(summary["story"]))
         self.members = inc["members"]
         rows = []
         for r, codes in zip(self.members, summary["member_codes"]):
@@ -11272,7 +12038,131 @@ class IncidentsWindow(QWidget):
             menu.addAction("Copy Transcript", lambda: copy_text(r["text"]))
         for key in r["units"]:
             self.monitor.add_unit_menu(menu, key, parent=self)
+        inc = self.current()
+        if inc is not None:
+            menu.addSeparator()
+            menu.addAction("Take This Call Out of the Incident", lambda: self.remove_call(r))
+            split = menu.addAction("Start a New Incident from This Call", lambda: self.split_at(r))
+            split.setEnabled(call_id(r) != inc["ids"][0])
         menu.exec(self.timeline.viewport().mapToGlobal(point))
+
+    # ---- Your own fixes (v1.1.87) ----
+    def change_edits(self, change, select_id=None):
+        day = self.days.currentText()
+        if not day:
+            return
+        edits = load_incident_edits(day)
+        change(edits)
+        try:
+            save_incident_edits(day, edits)
+        except OSError as exc:
+            QMessageBox.warning(self, "Incidents", f"Your change could not be saved:\n{exc}")
+            return
+        self.recompute()
+        if select_id:
+            for i, inc in enumerate(getattr(self, "visible", [])):
+                if select_id in inc["ids"]:
+                    select_index(self.table, i)
+                    break
+
+    def incident_menu(self, point):
+        item = self.table.itemAt(point)
+        if item is None:
+            return
+        self.table.selectRow(item.row())
+        inc = self.current()
+        if inc is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("Edit Headline…", lambda: self.edit_headline(inc))
+        menu.addAction("Note…", lambda: self.edit_note(inc))
+        types = menu.addMenu("Set Type")
+        auto = types.addAction(f"Automatic ({INCIDENT_TYPE_LABELS[inc['summary']['automatic_type']]})",
+                               lambda: self.set_type(inc, ""))
+        auto.setCheckable(True)
+        auto.setChecked(not inc.get("type_override"))
+        for key, label, _c, _p in INCIDENT_TYPES:
+            a = types.addAction(label, lambda k=key: self.set_type(inc, k))
+            a.setCheckable(True)
+            a.setChecked(inc.get("type_override") == key)
+        merge = menu.addAction("Merge with Another Incident…", lambda: self.merge_with(inc))
+        merge.setEnabled(len(self.incidents) > 1)
+        if inc["hidden"]:
+            menu.addAction("Show Again", lambda: self.set_hidden(inc, False))
+        else:
+            menu.addAction("Hide (Not an Incident)", lambda: self.set_hidden(inc, True))
+        undo = menu.addAction("Undo My Changes to This Incident", lambda: self.forget(inc))
+        undo.setEnabled(bool(inc.get("edited")))
+        menu.exec(self.table.viewport().mapToGlobal(point))
+
+    def edit_headline(self, inc):
+        text, ok = QInputDialog.getText(self, "Edit headline",
+                                        "Headline (leave empty for the automatic one):",
+                                        text=inc.get("headline_override") or inc["summary"]["headline"])
+        if not ok:
+            return
+        text = text.strip()
+
+        def change(edits):
+            for c in inc["ids"]:
+                edits["headlines"].pop(c, None)
+            if text and text != inc["summary"].get("automatic_headline"):
+                edits["headlines"][inc["ids"][0]] = text
+        self.change_edits(change, inc["ids"][0])
+
+    def edit_note(self, inc):
+        text, ok = QInputDialog.getMultiLineText(self, "Note", "Your note on this incident (kept with your fixes; "
+                                                 "leave empty to remove it):", inc.get("note", ""))
+        if not ok:
+            return
+
+        def change(edits):
+            for c in inc["ids"]:
+                edits["notes"].pop(c, None)
+            if text.strip():
+                edits["notes"][inc["ids"][0]] = text.strip()
+        self.change_edits(change, inc["ids"][0])
+
+    def set_type(self, inc, key):
+        def change(edits):
+            for c in inc["ids"]:
+                edits["types"].pop(c, None)
+            if key:
+                edits["types"][inc["ids"][0]] = key
+        self.change_edits(change, inc["ids"][0])
+
+    def merge_with(self, inc):
+        others = [o for o in self.incidents if o is not inc]
+        others.sort(key=lambda o: abs((o["start"] - inc["start"]).total_seconds()))
+        names = [f"{o['start']:%H:%M:%S} — {o['summary']['headline']}" for o in others]
+        name, ok = QInputDialog.getItem(self, "Merge incidents", "Merge with (nearest first):", names, 0, False)
+        if not ok or name not in names:
+            return
+        other = others[names.index(name)]
+
+        def change(edits):
+            both = set(inc["ids"]) | set(other["ids"])
+            edits["splits"] = [c for c in edits["splits"] if c not in both]
+            edits["joins"].append([inc["ids"][0], other["ids"][0]])
+        self.change_edits(change, inc["ids"][0])
+
+    def set_hidden(self, inc, hide):
+        def change(edits):
+            edits["hidden"] = [c for c in edits["hidden"] if c not in inc["ids"]]
+            if hide:
+                edits["hidden"].append(inc["ids"][0])
+        self.change_edits(change, inc["ids"][0])
+
+    def forget(self, inc):
+        self.change_edits(lambda edits: forget_incident_edits(edits, inc, self.gap.value() * 60), inc["ids"][0])
+
+    def remove_call(self, r):
+        inc = self.current()
+        keep = next((c for c in (inc["ids"] if inc else []) if c != call_id(r)), None)
+        self.change_edits(lambda edits: edits["removed"].append(call_id(r)), keep)
+
+    def split_at(self, r):
+        self.change_edits(lambda edits: edits["splits"].append(call_id(r)), call_id(r))
 
     def export(self):
         inc = self.current()
@@ -11296,6 +12186,12 @@ class IncidentsWindow(QWidget):
                                     f"{r['duration']:.1f}", r["text"] or ""])
                 else:
                     f.write(self.detail.text() + "\n\n")
+                    f.write(f"Type: {INCIDENT_TYPE_LABELS[inc['summary']['type']]}\n")
+                    if inc.get("note"):
+                        f.write(f"Note: {inc['note']}\n")
+                    story = incident_story_text(inc["summary"]["story"])
+                    if story:
+                        f.write("\n" + story + "\n\n")
                     for r, codes in zip(inc["members"], inc["summary"]["member_codes"]):
                         units = ", ".join(self.monitor.unit_title(u) for u in r["units"]) or "—"
                         f.write(f"{r['start']:%H:%M:%S}  {r['label']}  [{units}]  {r['duration']:.0f} s\n")
@@ -11776,6 +12672,7 @@ PHONE_CATEGORIES = [("activity", "Unusual activity (Activity Watch)"),
                     ("wx_alert", "Weather alerts (NOAA Weather Alert mode)"),
                     ("aircraft", "Aircraft: emergency squawks and watched aircraft (ADS-B)"),
                     ("keyword", "Keyword alerts (Transcript rules)"),
+                    ("incident", "An incident grows (more units or agencies; set up in History → Incidents)"),
                     ("alert", "Other alert rules (channel, talkgroup, unit…)")]
 PHONE_DEFAULT_CATEGORIES = {"activity", "new_talkgroup", "keyword", "close_call",
                             "tone_out", "wx_alert", "aircraft"}
@@ -11977,6 +12874,384 @@ class PhoneNotifier(QObject):
         self.note(ok, text)
         if not ok:
             self.monitor.statusBar().showMessage("Phone alert " + text, 10000)
+
+
+# ---- Alert sounds (v1.1.85) --------------------------------------------------------------------
+#
+# Tools → Alerts → Alert Sounds…: a sound for each kind of desktop alert. Each kind can play a
+# sound file (.wav, .ogg, .oga, .flac, .mp3), one of the system's sounds (the sound themes in
+# /usr/share/sounds, such as KDE's Ocean and freedesktop), or nothing, at its own volume.
+# The sound is played by paplay (PulseAudio / PipeWire), pw-play or ffplay, whichever can play the
+# file; with none of them the desktop beep is used. Settings: alertsounds/<kind> = JSON
+# {"source": "system" | "file" | "none", "sound": theme/name or a path, "volume": 0–100}.
+
+ALERT_SOUND_KINDS = [
+    ("activity", "Activity Watch: unusual activity"),
+    ("new_talkgroup", "Activity Watch: new talkgroup (first heard)"),
+    ("new_unit", "Activity Watch: new radio (first heard)"),
+    ("returning", "Activity Watch: radio back after a quiet spell"),
+    ("tone_out", "Tone-Out: tones detected"),
+    ("wx_alert", "Weather Alert (SAME / FIPS)"),
+    ("close_call", "Close Call: new or watched frequency"),
+    ("aircraft", "Aircraft (ADS-B): emergency squawk, watched aircraft"),
+    ("keyword", "Keyword alerts (transcript rules)"),
+    ("incident", "Incidents: an incident grows (more units or agencies)"),
+    ("alert", "Other alert rules (channel, talkgroup, unit…)"),
+]
+ALERT_SOUND_DEFAULT = "freedesktop/message-new-instant"      # what every alert played before 1.1.85
+ALERT_SOUND_SUFFIXES = (".oga", ".ogg", ".wav", ".flac", ".mp3")
+ALERT_SOUND_THEME_DIRS = [Path.home() / ".local" / "share" / "sounds", Path("/usr/local/share/sounds"),
+                          Path("/usr/share/sounds")]
+ALERT_SOUND_FILE_FILTER = "Sound files (*.wav *.ogg *.oga *.flac *.mp3);;All files (*)"
+
+
+def system_sounds(dirs=None):
+    """{'theme/name': path} for the sound themes installed (theme/stereo/name.oga and the like).
+    A theme in an earlier folder (your own ~/.local/share/sounds) wins over the same name later."""
+    found = {}
+    for base in dirs or ALERT_SOUND_THEME_DIRS:
+        try:
+            themes = sorted(p for p in Path(base).iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for theme in themes:
+            for sub in ("stereo", ""):
+                folder = theme / sub if sub else theme
+                try:
+                    files = sorted(folder.iterdir())
+                except OSError:
+                    continue
+                for f in files:
+                    if f.is_file() and f.suffix.lower() in ALERT_SOUND_SUFFIXES:
+                        found.setdefault(f"{theme.name}/{f.stem}", str(f))
+    return found
+
+
+def system_sound_label(key):
+    """'ocean/message-new-instant' → 'Message new instant (Ocean)'."""
+    theme, _, name = key.partition("/")
+    return f"{name.replace('-', ' ').replace('_', ' ').capitalize()} ({theme.capitalize()})"
+
+
+def clean_sound_choice(data):
+    """A valid choice from saved settings (anything odd falls back to the default sound)."""
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            data = None
+    if not isinstance(data, dict):
+        data = {}
+    source = data.get("source") if data.get("source") in ("system", "file", "none") else "system"
+    sound = str(data.get("sound") or "").strip()
+    if source == "system" and not sound:
+        sound = ALERT_SOUND_DEFAULT
+    try:
+        volume = max(0, min(100, int(data.get("volume", 100))))
+    except (TypeError, ValueError):
+        volume = 100
+    return {"source": source, "sound": sound, "volume": volume}
+
+
+def sound_player_command(path, volume, which=shutil.which):
+    """The command that plays path at volume (0–100), or None when nothing here can play it.
+    MP3 goes to ffplay first: paplay/pw-play only read it with a recent libsndfile."""
+    volume = max(0, min(100, int(volume)))
+    players = {
+        "paplay": lambda: ["paplay", f"--volume={round(65536 * volume / 100)}", str(path)],
+        "pw-play": lambda: ["pw-play", f"--volume={volume / 100:.2f}", str(path)],
+        "ffplay": lambda: ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                           "-volume", str(volume), str(path)],
+    }
+    order = (["ffplay", "pw-play", "paplay"] if Path(str(path)).suffix.lower() == ".mp3"
+             else ["paplay", "pw-play", "ffplay"])
+    for name in order:
+        if which(name):
+            return players[name]()
+    return None
+
+
+class AlertSounds:
+    """Which sound each kind of alert plays, and playing it."""
+    REPEAT_GAP_S = 0.7          # the same kind's sound isn't restarted on top of itself
+
+    def __init__(self, settings, popen=None, which=None, beep=None, sounds=None):
+        self.settings = settings
+        self.popen = popen or (lambda cmd: subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                                              stderr=subprocess.DEVNULL))
+        self.which = which or shutil.which
+        self.beep = beep or (lambda: QApplication.beep())
+        self._sounds = sounds
+        self.last_played = {}
+        self.last_problem = ""
+
+    def sounds(self, refresh=False):
+        if self._sounds is None or refresh:
+            self._sounds = system_sounds()
+        return self._sounds
+
+    @staticmethod
+    def kind_of(category):
+        known = {k for k, _ in ALERT_SOUND_KINDS}
+        return category if category in known else "alert"     # "test" and anything new
+
+    def choice(self, kind):
+        return clean_sound_choice(self.settings.value(f"alertsounds/{self.kind_of(kind)}", ""))
+
+    def set_choice(self, kind, source, sound, volume):
+        choice = clean_sound_choice({"source": source, "sound": sound, "volume": volume})
+        self.settings.setValue(f"alertsounds/{self.kind_of(kind)}", json.dumps(choice))
+        return choice
+
+    def reset(self):
+        for kind, _ in ALERT_SOUND_KINDS:
+            self.settings.remove(f"alertsounds/{kind}")
+
+    def resolve(self, kind):
+        """(path or None, volume, problem). None with no problem means "no sound"."""
+        c = self.choice(kind)
+        if c["source"] == "none":
+            return None, 0, ""
+        sounds = self.sounds()
+        if c["source"] == "file":
+            if c["sound"] and Path(c["sound"]).expanduser().is_file():
+                return str(Path(c["sound"]).expanduser()), c["volume"], ""
+            problem = f"sound file not found: {c['sound'] or '(none chosen)'}"
+        else:
+            if c["sound"] in sounds:
+                return sounds[c["sound"]], c["volume"], ""
+            problem = f"system sound not installed: {c['sound']}"
+        fallback = sounds.get(ALERT_SOUND_DEFAULT) or next(iter(sounds.values()), None)
+        return fallback, c["volume"], problem
+
+    def play(self, kind, force=False, now=None):
+        """Play the sound for an alert of this kind. Returns what was done, for messages and tests:
+        'none', 'skipped', 'beep' or the command run."""
+        kind = self.kind_of(kind)
+        now = time.monotonic() if now is None else now
+        if not force and now - self.last_played.get(kind, -1e9) < self.REPEAT_GAP_S:
+            return "skipped"
+        self.last_played[kind] = now
+        path, volume, problem = self.resolve(kind)
+        self.last_problem = problem
+        if path is None and not problem:
+            return "none"
+        if path is not None and volume > 0:
+            cmd = sound_player_command(path, volume, self.which)
+            if cmd:
+                try:
+                    self.popen(cmd)
+                    return cmd
+                except OSError as exc:
+                    self.last_problem = f"couldn't play the sound: {exc}"
+        if volume == 0 and path is not None:
+            return "none"
+        self.beep()
+        return "beep"
+
+
+class AlertSoundsDialog(QDialog):
+    """Tools → Alerts → Alert Sounds…: one sound, volume and TEST for each kind of alert."""
+
+    def __init__(self, monitor, parent=None):
+        super().__init__(parent or monitor)
+        self.monitor = monitor
+        self.sounds = monitor.alert_sounds
+        self.setWindowTitle("Alert sounds")
+        self.resize(900, 560)
+        layout = QVBoxLayout(self)
+        s = monitor.settings
+        self.master = QCheckBox("Play a sound with alerts")
+        set_css(self.master, "font-weight:700;")
+        self.master.setChecked(str(s.value("alerts/sound", "true")).lower() == "true")
+        self.master.toggled.connect(self.master_toggled)
+        layout.addWidget(self.master)
+        intro = make_label("Choose what each kind of alert plays: one of the system's sounds, a sound file of "
+                           "your own (.wav, .ogg, .oga, .flac or .mp3), or nothing. TEST plays it as an alert "
+                           "would. Changes are kept straight away.")
+        intro.setWordWrap(True)
+        set_css(intro, "color:#a5bdd2;")
+        layout.addWidget(intro)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        for col, title in enumerate(("Alert", "Sound", "File", "", "Volume", "", "")):
+            if title:
+                head = make_label(title)
+                set_css(head, "font-weight:700;color:#8bd6f2;")
+                grid.addWidget(head, 0, col)
+        self.rows = {}
+        for r, (kind, label) in enumerate(ALERT_SOUND_KINDS, start=1):
+            name = make_label(label)
+            sound = QComboBox()
+            path = QLineEdit()
+            path.setPlaceholderText("Choose a sound file…")
+            browse = QPushButton("…")
+            browse.setToolTip("Choose a sound file")
+            browse.setMaximumWidth(34)
+            volume = QSlider(Qt.Orientation.Horizontal)
+            volume.setRange(0, 100)
+            volume.setMinimumWidth(110)
+            percent = make_label("100%")
+            percent.setMinimumWidth(40)
+            test = QPushButton("TEST")
+            test.setToolTip("Play this alert's sound now")
+            for c, w in enumerate((name, sound, path, browse, volume, percent, test)):
+                grid.addWidget(w, r, c)
+            self.rows[kind] = {"sound": sound, "path": path, "browse": browse, "volume": volume,
+                               "percent": percent, "test": test}
+            sound.currentIndexChanged.connect(lambda _i, k=kind: self.changed(k))
+            path.editingFinished.connect(lambda k=kind: self.changed(k))
+            browse.clicked.connect(lambda _c=False, k=kind: self.browse(k))
+            volume.valueChanged.connect(lambda v, k=kind: self.volume_moved(k, v))
+            volume.sliderReleased.connect(lambda k=kind: self.changed(k))
+            test.clicked.connect(lambda _c=False, k=kind: self.test(k))
+        grid.setColumnStretch(2, 1)
+        layout.addLayout(grid)
+        self.status = make_label("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        buttons = QHBoxLayout()
+        same = QPushButton("USE ONE SOUND FOR ALL…")
+        same.setToolTip("Copy one alert's sound and volume to every other alert")
+        same.clicked.connect(self.use_for_all)
+        reset = QPushButton("RESET TO DEFAULTS")
+        reset.setToolTip("Every alert back to the system's message sound at full volume")
+        reset.clicked.connect(self.reset)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(same)
+        buttons.addWidget(reset)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        self._loading = False
+        self.load()
+
+    def fill_combo(self, combo, choice):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("None (silent)", "none:")         # data as text: Qt compares it reliably
+        sounds = self.sounds.sounds()
+        keys = sorted(sounds, key=lambda k: (k != ALERT_SOUND_DEFAULT, k.split("/")[0], k))
+        for key in keys:
+            combo.addItem(system_sound_label(key), "system:" + key)
+        if choice["source"] == "system" and choice["sound"] not in sounds:
+            combo.addItem(system_sound_label(choice["sound"]) + " — not installed", "system:" + choice["sound"])
+        combo.addItem("Sound file", "file:")
+        want = choice["source"] + ":" + (choice["sound"] if choice["source"] == "system" else "")
+        index = combo.findData(want)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def load(self):
+        self._loading = True
+        for kind, w in self.rows.items():
+            c = self.sounds.choice(kind)
+            self.fill_combo(w["sound"], c)
+            w["path"].setText(c["sound"] if c["source"] == "file" else "")
+            w["volume"].blockSignals(True)
+            w["volume"].setValue(c["volume"])
+            w["volume"].blockSignals(False)
+            set_text(w["percent"], f"{c['volume']}%")
+            self.enable_row(kind)
+        self._loading = False
+        self.master_toggled(self.master.isChecked(), save=False)
+
+    def enable_row(self, kind):
+        w = self.rows[kind]
+        source = str(w["sound"].currentData() or "none:").partition(":")[0]
+        w["path"].setEnabled(source == "file")
+        w["browse"].setEnabled(source == "file")
+        w["volume"].setEnabled(source != "none")
+        w["test"].setEnabled(source != "none")
+
+    def current(self, kind):
+        w = self.rows[kind]
+        source, _, key = str(w["sound"].currentData() or "none:").partition(":")
+        sound = w["path"].text().strip() if source == "file" else key
+        return source, sound, w["volume"].value()
+
+    def changed(self, kind):
+        if self._loading:
+            return
+        self.enable_row(kind)
+        source, sound, volume = self.current(kind)
+        self.sounds.set_choice(kind, source, sound, volume)
+        if source == "file" and not sound:
+            self.say("Choose a sound file with …, or type its path.")
+        elif source == "file" and not Path(sound).expanduser().is_file():
+            self.say(f"Sound file not found: {sound}. The system's message sound plays instead.", "bad")
+        else:
+            self.say("")
+
+    def volume_moved(self, kind, value):
+        set_text(self.rows[kind]["percent"], f"{value}%")
+        if not self.rows[kind]["volume"].isSliderDown():
+            self.changed(kind)
+
+    def browse(self, kind):
+        w = self.rows[kind]
+        start = w["path"].text().strip() or str(Path.home() / "Music")
+        if not Path(start).expanduser().exists():
+            start = str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a sound file", start, ALERT_SOUND_FILE_FILTER)
+        if path:
+            w["path"].setText(path)
+            self.changed(kind)
+
+    def test(self, kind):
+        self.changed(kind)
+        result = self.sounds.play(kind, force=True)
+        label = dict(ALERT_SOUND_KINDS)[kind]
+        if result == "beep":
+            self.say(f"{label}: no player for this sound (install pulseaudio-utils, pipewire-bin or "
+                     "ffmpeg), so the desktop beep was used."
+                     + (f" ({self.sounds.last_problem})" if self.sounds.last_problem else ""), "bad")
+        elif self.sounds.last_problem:
+            self.say(f"{label}: {self.sounds.last_problem}; played the system's message sound instead.", "bad")
+        elif result == "none":
+            self.say(f"{label}: silent.")
+        else:
+            self.say(f"{label}: playing.")
+
+    def use_for_all(self):
+        names = [label for _, label in ALERT_SOUND_KINDS]
+        picked, ok = QInputDialog.getItem(self, "Use one sound for all",
+                                          "Copy the sound and volume of:", names, 0, False)
+        if not ok:
+            return
+        kind = ALERT_SOUND_KINDS[names.index(picked)][0]
+        source, sound, volume = self.current(kind)
+        for other, _ in ALERT_SOUND_KINDS:
+            self.sounds.set_choice(other, source, sound, volume)
+        self.load()
+        self.say(f"Every alert now uses the sound of “{picked}”.")
+
+    def reset(self):
+        if QMessageBox.question(self, "Alert sounds", "Put every alert back to the system's message sound "
+                                "at full volume?") != QMessageBox.StandardButton.Yes:
+            return
+        self.sounds.reset()
+        self.load()
+        self.say("Every alert uses the system's message sound again.")
+
+    def master_toggled(self, on, save=True):
+        if save:
+            self.monitor.settings.setValue("alerts/sound", bool(on))
+            panel = getattr(self.monitor, "alerts_panel", None)
+            box = getattr(panel, "sound_box", None)
+            if box is not None and box.isChecked() != bool(on):
+                box.blockSignals(True)
+                box.setChecked(bool(on))
+                box.blockSignals(False)
+        if not on:
+            self.say("Alert sounds are off: alerts are silent until this is ticked again. TEST still plays.")
+        elif save:
+            self.say("")
+
+    def say(self, text, tone="ok"):
+        set_css(self.status, "color:#ff8a80;" if tone == "bad" else "color:#a5bdd2;")
+        set_text(self.status, text)
 
 
 class PhoneSettingsDialog(QDialog):
@@ -12355,8 +13630,10 @@ def search_everything(query, range_key, kinds, unit_names=None, today=None, canc
             recs = receptions_with_units(day)
             prev = (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
             hubs = find_hubs(recs + receptions_with_units(prev), unit_names)
-            for inc in build_incidents(recs, hubs):
-                hay = " ".join([inc["title"]] + inc["talkgroups"]
+            for inc in build_incidents(recs, hubs, edits=load_incident_edits(day)):
+                if inc["hidden"]:
+                    continue
+                hay = " ".join([inc["title"], inc["headline_override"], inc["note"]] + inc["talkgroups"]
                                + [f"uid:{u}" for u in inc["units"]]
                                + [(unit_names.name(u) if unit_names else "") for u in inc["units"]]
                                + [r["text"] or "" for r in inc["members"]]
@@ -18684,6 +19961,138 @@ APCO_TEN_CODES = [
     ("10-34", "Time"),
 ]
 
+# Local lists for the personal build only. Copied from the RadioReference wiki for personal use;
+# check RadioReference's terms before distributing them.
+SCHP_TEN_CODES = [
+    ("10-0", "Pursuit in progress"), ("10-1", "Signal weak"), ("10-2", "Signal good"),
+    ("10-3", "Stop transmitting"), ("10-4", "Message received"), ("10-5", "Relay"), ("10-6", "Busy"),
+    ("10-7", "Out of service"), ("10-8", "In service"), ("10-9", "Repeat"), ("10-10", "Negative"),
+    ("10-11", "On duty"), ("10-12", "Standby"), ("10-13", "Report conditions"),
+    ("10-14", "Message/Information"), ("10-15", "Message delivered"), ("10-16", "Reply to message"),
+    ("10-17", "Enroute"), ("10-18", "Urgent"), ("10-19", "In contact"),
+    ("10-20", "(Advise your) Location"), ("10-21", "Phone (number)"), ("10-22", "Disregard"),
+    ("10-23", "Arrived at scene"), ("10-24", "Assignment complete"), ("10-25", "Meet up at ____"),
+    ("10-26", "Estimated time of arrival"), ("10-27", "Driver's license"),
+    ("10-28", "Vehicle registration"), ("10-29", "Check for warrants"), ("10-30", "Danger/Caution"),
+    ("10-31", "Pick up"), ("10-32", "____ units needed quickly"), ("10-33", "Emergency"),
+    ("10-34", "Correct time"), ("10-35", "Radar"), ("10-36", "Abandoned vehicle"),
+    ("10-37", "Mobile Data Computer"), ("10-38", "Normal traffic stop"), ("10-39", "Vehicle search"),
+    ("10-40", "Road repairs"), ("10-41", "Beginning shift"), ("10-42", "End shift"),
+    ("10-43", "Time check"), ("10-44", "Unable to locate"), ("10-45", "Dead animal"),
+    ("10-46", "Assist motorist"), ("10-47", "Investigate suspicious vehicle"),
+    ("10-48", "Stopping suspicious vehicle"), ("10-49", "Civil disturbance"),
+    ("10-50", "Motor vehicle accident"), ("10-51", "Request tow truck"),
+    ("10-52", "Request ambulance"), ("10-53", "Roadway blocked"), ("10-54", "Direct traffic"),
+    ("10-55", "Intoxicated driver"), ("10-56", "Intoxicated pedestrian"),
+    ("10-57", "Hit and run MVA"), ("10-58", "Riot"), ("10-59", "Person with gun"),
+    ("10-60", "Request coroner"), ("10-61", "Illegal use of radio"), ("10-62", "Escaped prisoner"),
+    ("10-63", "Advise phone number"), ("10-64", "Bomb threat"), ("10-65", "Blockade"),
+    ("10-66", "Drag racing"), ("10-67", "Subject in custody"), ("10-68", "Mental subject"),
+    ("10-69", "Detaining subject - Expedite"), ("10-70", "Fire alarm"),
+    ("10-71", "Wanted/Stolen indicated"), ("10-72", "Larceny"), ("10-73", "Break-in"),
+    ("10-74", "Robbery"), ("10-75", "Shooting"), ("10-76", "Assault"), ("10-77", "Vandalism"),
+    ("10-78", "Request assistance"), ("10-79", "Prowler"), ("10-80", "Suspicious person"),
+    ("10-81", "Missing person"), ("10-82", "Domestic problem"), ("10-83", "Crime in progress"),
+    ("10-84", "Estimated time of arrival"), ("10-85", "Alarm"),
+    ("10-86", "Out of vehicle - Available"), ("10-87", "Permission to leave patrol"),
+    ("10-88", "Squad in vicinity"), ("10-89", "Escort"), ("10-90", "Prepare to copy"),
+    ("10-91", "Return to ____"), ("10-92", "Delayed"), ("10-93", "Message received"),
+    ("10-94", "General Broadcast"), ("10-95", "Prisoner"), ("10-96", "Breathalyzer operator"),
+    ("10-97", "Test signal"), ("10-98", "Switch to regional channel"),
+    ("10-99", "Traffic signal not working"),
+    ("Signal 1", "Handle by mail"), ("Signal 2", "Delivered"), ("Signal 3", "Delivered"),
+    ("Signal 4", "Changing channel/comm center; or use lights/siren"),
+    ("Signal 5", "Permission to use patrol car"), ("Signal 6", "Permission to go to Columbia HQ"),
+    ("Signal 7", "Send ___ to Columbia for vehicle"), ("Signal 8", "Permission to go to Columbia HQ"),
+    ("Signal 9", "Confidential investigation"), ("Signal 10", "Remain in vehicle/Stay in service"),
+    ("Signal 11", "If not stolen, check owner disposition"),
+    ("Signal 12", "No information available"), ("Signal 13", "Request to go out of service"),
+    ("Signal 14", "Relay to local broadcast stations"), ("Signal 15", "Resume normal operations"),
+    ("Signal 16", "Out of vehicle, radio on"), ("Signal 17", "Officer-initiated complaint"),
+    ("Signal 18", "No further assistance needed"), ("Signal 19", "Do not use radio"),
+    ("Signal 20", "Tower lights out"), ("Signal 21", "Visitors present"),
+    ("Signal 22", "Zone assignment"), ("Signal 24", "Sex offender"),
+    ("Signal 26", "Switch to channel 1"), ("Signal 27", "Switch to channel 2"),
+    ("Signal 28", "Switch to channel 3"), ("Signal 29", "Switch to channel 5"),
+    ("Signal 30", "Rape"), ("Signal 31", "Kidnapping"), ("Signal 32", "Homicide"),
+    ("Signal 33", "Armed robbery"), ("Signal 34", "Strong-arm robbery"),
+    ("Signal 35", "Burglary from vehicle"), ("Signal 36", "Animal complaint"),
+    ("Signal 37", "Unlocked vehicle"), ("Signal 38", "Human error"),
+    ("Signal 39", "Mechanical error"), ("Signal 40", "Residence check"),
+]
+
+GREENVILLE_TEN_CODES = [
+    ("10-0", "Caution", ""), ("10-1", "Poor signal", ""), ("10-2", "Good signal", ""),
+    ("10-3", "Cancel last message", ""), ("10-4", "Okay", ""), ("10-5", "En route", ""),
+    ("10-6", "Arrived on scene", ""), ("10-7", "Out of service", ""), ("10-8", "In service", ""),
+    ("10-9", "Repeat", ""), ("10-10", "Out of vehicle with radio", ""),
+    ("10-11", "Remain in service", ""),
+    ("10-12", "Visitor present", "B. Official; C. Victim; D. Suspect; E. Other"),
+    ("10-13", "Meal", ""), ("10-14", "Escort", "B. Jail to ER; C. Mental patient"),
+    ("10-15", "Non-criminal assistance/service", "B. Slim Jim assist; C. Jumper cables; D. Fuel; E. Other"),
+    ("10-16", "Expedite completion of assignment", ""), ("10-17", "Any messages for this unit?", ""),
+    ("10-18", "Message delivered", ""), ("10-19", "Meet ____", ""), ("10-20", "Location", ""),
+    ("10-21", "Telephone", ""), ("10-22", "Switch to regional channel", ""),
+    ("10-23", "Improper use of radio", "B. Confidential information - not for broadcast"),
+    ("10-24", "Meet complainant", ""), ("10-25", "Relay", ""), ("10-26", "Unit busy", ""),
+    ("10-27", "Estimated time of arrival", ""), ("10-28", "Correct time", ""), ("10-29", "Follow-up", ""),
+    ("10-30", "Send ____", "B. Identification officer; C. Coroner; D. Bloodhounds; E. Drug dog"),
+    ("10-31", "Officer involved", "B. Shooting; C. Accident; D. Complainant"),
+    ("10-32", "Service center", ""), ("10-33", "EMS requesting police", ""),
+    ("10-34", "House check", "B. Senior citizen check"), ("10-35", "Background noise", ""),
+    ("10-36", "Extra patrol", "B. Bank alarm out"), ("10-37", "Double car", ""),
+    ("10-38", "Crime watch program", ""), ("10-39", "Medical precaution", ""), ("10-40", "Fire", ""),
+    ("10-41", "Request backup", "B. Expedite backup"), ("10-42", "General broadcast/all units", ""),
+    ("10-43", "Hold radio traffic/emergency communication", ""),
+    ("10-44", "Alarm", "B. Hold-up; C. Monitor; D. Silent; E. Audible; F. P/C; number and location"),
+    ("10-45", "Robbery", "A. In progress; B. Already occurred"),
+    ("10-46", "Prisoner in custody", "B. Female; C. Juvenile"), ("10-47", "Mental case patient", ""),
+    ("10-48", "Escapee", ""),
+    ("10-49", "Weapon", "A. In progress; B. Discharging or in use; C. Possession in the open; "
+                        "D. Possession concealed; E. Purchase violation"),
+    ("10-50", "Motor vehicle accident", "B. Personal injury (PI); C. Hit and run"),
+    ("10-51", "Request ambulance", ""),
+    ("10-52", "Traffic congestion", "B. Obstruction (specify); C. Traffic light out; "
+                                    "D. Weather or road condition; E. Other (specify)"),
+    ("10-53", "Investigate vehicle", "B. Abandoned; C. Suspicious"),
+    ("10-54", "Request information", "B. Driver's license (DL); C. Tag/registration; "
+                                     "D. Wants/warrants/vehicle/person; E. NCIC check"),
+    ("10-55", "Request wrecker", ""), ("10-56", "Vehicle stop", ""),
+    ("10-57", "Reckless driver", "B. Reckless driving; C. Speeding; D. Other (specify)"),
+    ("10-58", "Pursuit", ""), ("10-59", "Intoxicated driver", "B. Breathalyzer required"),
+    ("10-60", "Work school crossing", ""), ("10-61", "Radar request", ""),
+    ("10-62", "Vehicle check-point", ""), ("10-64", "Traffic control", ""),
+    ("10-65", "Check on crossing guard", ""),
+    ("10-70", "Hazard", "B. Bomb/other threat; C. Chemical leak or accident; D. Explosion; E. Other (specify)"),
+    ("10-71", "Nuisance call", "B. Animal; C. Loud music; D. Fireworks; E. Other"),
+    ("10-72", "Deceit incidents", "B. Breach of trust; C. Forgery; D. Fraud; E. Other (specify)"),
+    ("10-73", "Intoxicated person", ""), ("10-74", "Malicious mischief/vandalism", ""),
+    ("10-75", "Missing person", ""),
+    ("10-76", "Telephone incident", "B. Threatening call; C. Harassing call; D. Obscene call"),
+    ("10-77", "Trespassing", ""),
+    ("10-78", "Serving legal papers", "B. Warrants; C. Civil papers; D. Other (specify)"),
+    ("10-79", "Special assignment", ""), ("10-80", "Domestic dispute", "B. Child abuse & neglect"),
+    ("10-81", "Disturbance or fight", "B. 911 hang up"),
+    ("10-82", "Sexual assault", "B. Rape; C. Molesting; D. Indecent exposure; E. Other (specify)"),
+    ("10-83", "Vice or intoxicant violation",
+     "B. Narcotics; C. Prostitution; D. Gambling; E. Alcohol; F. Other (specify)"),
+    ("10-84", "Theft", "B. Grand larceny; C. Petty larceny; D. Shoplifting"),
+    ("10-85", "Breaking & entering or burglary", "A. In progress; B. Business; C. Residence; D. Auto; E. Open door"),
+    ("10-86", "Assault", ""),
+    ("10-87", "Stolen vehicle", "B. Auto; C. Motorcycle; D. Bicycle; E. Other (specify)"),
+    ("10-88", "Suspicious person", "B. Loitering; C. Prowler or peeping tom"),
+    ("10-89", "Death investigation", "A. In progress/just occurred; B. Murder/manslaughter; "
+                                     "C. Deceased person; D. Suicide"),
+    ("10-90", "Kidnapping", "A. In progress/just occurred; B. Minor; C. Adult"),
+    ("10-91", "911 hang-up (or littering/illegal dumping)", ""),
+    ("10-92", "Property", "B. Recovered; C. Found; D. Lost"), ("10-93", "Information only", ""),
+    ("10-94", "Special teams", "A. SWAT requested; B. Field force; C. Dive team"),
+]
+
+RR_NOTE = ("RadioReference wiki, for personal use; check RadioReference's terms before sharing. "
+           "Codes change: check with the agency.")
+
+
 def _ten_code_list(list_id, name, source, codes, agencies=(), area=None):
     return {"id": list_id, "name": name, "source": source, "builtin": True, "enabled": True,
             "agencies": list(agencies), "area": dict(area) if area else None,
@@ -18696,6 +20105,16 @@ def builtin_ten_code_lists(edition=None):
     lists = [_ten_code_list("apco-1974", "APCO standard (1974)",
                             "APCO Project 14 ten signals (1974). Used where no local list fits.",
                             APCO_TEN_CODES)]
+    if edition == "personal":
+        lists += [
+            _ten_code_list("sc-highway-patrol", "SC Highway Patrol",
+                           "SC Highway Patrol/Department of Public Safety. " + RR_NOTE, SCHP_TEN_CODES,
+                           ("Highway Patrol", "SCHP", "Troop"),
+                           {"lat": 33.84, "lon": -80.90, "range_mi": 160.0}),
+            _ten_code_list("greenville-sc", "Greenville City/County",
+                           "Greenville City/County (SC) agencies. " + RR_NOTE, GREENVILLE_TEN_CODES,
+                           ("Greenville",), {"lat": 34.89, "lon": -82.37, "range_mi": 25.0}),
+        ]
     return lists
 
 
@@ -19433,6 +20852,135 @@ def units_seen_before(day, days_back=NEW_UNIT_LOOKBACK_DAYS):
     return seen
 
 
+# -- Listening time and normal traffic for the daily report (v1.1.87) -------------------------------
+#
+# The Monitor notes each minute it is reading the scanner (coverage/coverage_YYYY-MM-DD.csv, one line per
+# minute), so a report can tell a quiet day from a day the Monitor wasn't running. Days before 1.1.87 have
+# no such file; for them the hours with any reception stand in.
+
+COVERAGE_DIR = DATA_DIR / "coverage"
+
+
+def coverage_path(day):
+    return COVERAGE_DIR / f"coverage_{day}.csv"
+
+
+class CoverageLog:
+    """Writes the current minute once while the scanner's status keeps arriving."""
+
+    def __init__(self):
+        self.last = None
+
+    def mark(self, now=None):
+        minute = (now or datetime.now()).strftime("%Y-%m-%d %H:%M")
+        if minute == self.last:
+            return
+        self.last = minute
+        try:
+            COVERAGE_DIR.mkdir(parents=True, exist_ok=True)
+            with coverage_path(minute[:10]).open("a", encoding="utf-8") as f:
+                f.write(minute + "\n")
+        except OSError:
+            pass                                # never let this stop monitoring
+
+
+def read_coverage(day):
+    """Minutes of the day (0–1439) the Monitor was listening, or None when the day has no record."""
+    try:
+        lines = coverage_path(day).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    minutes = set()
+    for line in lines:
+        try:
+            hh, mm = line.strip()[11:16].split(":")
+            minutes.add(int(hh) * 60 + int(mm))
+        except ValueError:
+            continue
+    return minutes
+
+
+def coverage_spans(minutes, join=5):
+    """[(first minute, last minute)] of listening, joining breaks of up to `join` minutes."""
+    spans = []
+    for m in sorted(minutes):
+        if spans and m - spans[-1][1] <= join:
+            spans[-1][1] = m
+        else:
+            spans.append([m, m])
+    return [tuple(s) for s in spans]
+
+
+def _clock(minute):
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def listening_hours(day, rows=None):
+    """(hours of the day that count as listened to, measured): hours with at least 30 minutes of listening,
+    or, with no record, hours with any reception."""
+    minutes = read_coverage(day)
+    if minutes is not None:
+        per_hour = Counter(m // 60 for m in minutes)
+        return {h for h, n in per_hour.items() if n >= 30}, True
+    rows = read_reception_day(day) if rows is None else rows
+    hours = set()
+    for row in rows:
+        t = parse_stamp(row[0])
+        if t is not None:
+            hours.add(t.hour)
+    return hours, False
+
+
+_NORMAL_CACHE = {}
+
+
+def normal_traffic(day, learn_days=28):
+    """Calls per talkgroup over the `learn_days` days before `day`, with the hours listened to.
+    {"days", "hours", "calls", "by_label"}; finished days don't change, so it is cached per day."""
+    key = (day, learn_days)
+    if key in _NORMAL_CACHE:
+        return _NORMAL_CACHE[key]
+    days = [d for d in history_days() if d < day][-learn_days:]
+    by_label, hours, calls, used = Counter(), 0, 0, 0
+    for d in days:
+        rows = read_reception_day(d)
+        listened, _measured = listening_hours(d, rows)
+        if not listened:
+            continue
+        used += 1
+        hours += len(listened)
+        for row in rows:
+            t = parse_stamp(row[0])
+            if t is None or t.hour not in listened:
+                continue
+            by_label[activity_label(row[3], row[7], row[5])] += 1
+            calls += 1
+    result = {"days": used, "hours": hours, "calls": calls, "by_label": by_label}
+    if len(_NORMAL_CACHE) > 20:
+        _NORMAL_CACHE.clear()
+    _NORMAL_CACHE[key] = result
+    return result
+
+
+def compare_with_normal(today_by_label, today_hours, normal, min_days=5, top=8):
+    """Talkgroups busier and quieter than usual for the hours listened to today.
+    {"ready", "expected", "busier" [(label, today, expected)], "quieter" [...]}"""
+    if normal["days"] < min_days or not normal["hours"] or not today_hours:
+        return {"ready": False, "expected": None, "busier": [], "quieter": []}
+    scale = today_hours / normal["hours"]
+    busier, quieter = [], []
+    for label in set(today_by_label) | set(normal["by_label"]):
+        n = today_by_label.get(label, 0)
+        expected = normal["by_label"].get(label, 0) * scale
+        if n >= 10 and n >= 2 * expected:
+            busier.append((label, n, expected))
+        elif expected >= 20 and n <= expected / 2:
+            quieter.append((label, n, expected))
+    busier.sort(key=lambda x: (-(x[1] - x[2]), x[0]))
+    quieter.sort(key=lambda x: (-(x[2] - x[1]), x[0]))
+    return {"ready": True, "expected": normal["calls"] * scale, "busier": busier[:top], "quieter": quieter[:top]}
+
+
 def daily_report_data(day, decode=None, unit_title=uid_label, gap=600, min_calls=3, unit_names=None):
     """Everything in one day's report, as plain data (no Qt)."""
     recs = receptions_with_units(day)
@@ -19465,12 +21013,23 @@ def daily_report_data(day, decode=None, unit_title=uid_label, gap=600, min_calls
     except ValueError:
         previous = ""
     hubs = find_hubs(recs + (receptions_with_units(previous) if previous else []), unit_names)
-    incidents = build_incidents(recs, hubs, gap=gap, min_calls=min_calls)
+    incidents = [i for i in build_incidents(recs, hubs, gap=gap, min_calls=min_calls,
+                                            edits=load_incident_edits(day)) if not i["hidden"]]
     places = [p for p in read_places(day) if p[11] != "hidden"]
     for inc in incidents:
         inc["summary"] = summarize_incident(inc, decode, places, unit_title)
     before = units_seen_before(day)
     new_units = [u for u, _n in units.most_common() if u not in before]
+    # v1.1.87: when the Monitor was listening, traffic compared with normal, and response times.
+    minutes = read_coverage(day)
+    listened, measured = listening_hours(day, [r["row"] for r in recs])
+    in_listened = Counter(r["label"] for r in recs if r["start"].hour in listened)
+    normal = normal_traffic(day)
+    comparison = compare_with_normal(in_listened, len(listened), normal)
+    comparison["today"] = sum(in_listened.values())
+    comparison["days"] = normal["days"]
+    on_scene = [i["summary"]["story"]["first_on_scene"] for i in incidents
+                if i["summary"]["story"]["first_on_scene"] is not None]
     air = sum(r["duration"] for r in recs)
     busiest = max(range(24), key=lambda h: hours[h]) if recs else None
     return {
@@ -19486,6 +21045,11 @@ def daily_report_data(day, decode=None, unit_title=uid_label, gap=600, min_calls
         "new_units": [(u, unit_title(u), units[u]) for u in new_units[:20]],
         "new_unit_count": len(new_units), "had_history": bool(before),
         "places": places, "alerts": read_mode_alerts(day), "hubs": [unit_title(h) for h in sorted(hubs)[:6]],
+        "coverage": {"measured": measured, "minutes": len(minutes) if minutes is not None else None,
+                     "spans": coverage_spans(minutes) if minutes else [], "hours": sorted(listened)},
+        "normal": comparison,
+        "on_scene": {"count": len(on_scene), "median": median(on_scene)},
+        "alert_log": [a for a in read_alert_log(day) if a[1] not in ("tone_out", "wx_alert", "test")],
     }
 
 
@@ -19505,6 +21069,41 @@ def _bar(value, top, colour="#2975b8", width=260):
     return (f'<table cellspacing="0" cellpadding="0" style="margin:0"><tr>'
             f'<td width="{pixels}" height="11" bgcolor="{colour}" style="background:{colour}"></td>'
             f'</tr></table>')
+
+
+def report_listening_text(coverage):
+    if not coverage:
+        return "—"
+    if not coverage.get("measured"):
+        return (f"not recorded this day; calls were heard in {len(coverage.get('hours', []))} of 24 hours")
+    minutes = coverage.get("minutes") or 0
+    spans = coverage.get("spans") or []
+    text = _duration_text(minutes * 60)
+    if spans:
+        shown = ", ".join(f"{_clock(a)}–{_clock(b + 1 if b < 1439 else b)}" for a, b in spans[:6])
+        text += f" ({shown}{', …' if len(spans) > 6 else ''})"
+    return text
+
+
+def report_normal_text(normal):
+    if not normal:
+        return "—"
+    if not normal.get("ready"):
+        return "needs 5 days of history first"
+    expected, today = normal.get("expected") or 0, normal.get("today", 0)
+    if expected < 1:
+        return f"{today:,} calls; usually almost none in these hours"
+    ratio = today / expected
+    word = ("much busier than usual" if ratio >= 1.5 else "busier than usual" if ratio >= 1.15 else
+            "much quieter than usual" if ratio <= 0.5 else "quieter than usual" if ratio <= 0.85 else "about usual")
+    return f"{word}: {today:,} calls in the hours listened to, usually about {expected:,.0f}"
+
+
+def report_on_scene_text(on_scene):
+    if not on_scene or not on_scene.get("count"):
+        return "not found in the transcripts"
+    return (f"median {on_scene['median'] / 60:.0f} min, from {on_scene['count']} "
+            f"incident{'s' if on_scene['count'] != 1 else ''} where a unit said it was on scene")
 
 
 def daily_report_html(data, version=None):
@@ -19538,7 +21137,11 @@ def daily_report_html(data, version=None):
             ("Busiest hour", f"{data['busiest_hour']:02d}:00 ({data['hours'][data['busiest_hour']]:,} calls)"),
             ("Systems", ", ".join(f"{e(s)} ({n:,})" for s, n in data["systems"][:4])),
             ("Radios heard", f"{data['unit_count']:,}" + (f" ({data['new_unit_count']:,} new)" if data["had_history"] else "")),
-            ("Incidents", f"{len(data['incidents']):,}"),
+            ("Listening", report_listening_text(data.get("coverage"))),
+            ("Compared with normal", report_normal_text(data.get("normal"))),
+            ("Incidents", f"{len(data['incidents']):,}"
+             + (f" ({e(incident_type_counts(data['incidents']))})" if data["incidents"] else "")),
+            ("First unit on scene", report_on_scene_text(data.get("on_scene"))),
             ("Transcribed calls", f"{data['transcribed']:,}"),
             ("Weather/Tone-Out alerts", f"{len(data['alerts']):,}")):
         out.append(f'<tr><th>{label}</th><td>{value}</td></tr>')
@@ -19552,6 +21155,19 @@ def daily_report_html(data, version=None):
                    f'<td class="num">{n if n else ""}</td></tr>')
     out.append("</table>")
 
+    normal = data.get("normal") or {}
+    if normal.get("ready") and (normal["busier"] or normal["quieter"]):
+        out.append("<h2>Compared with normal</h2>"
+                   f'<p class="muted">Calls in the hours the Monitor was listening, against the same hours on '
+                   f"the previous {normal['days']} days.</p><table><tr><th></th><th>Talkgroup / channel</th>"
+                   '<th class="num">Today</th><th class="num">Usually</th></tr>')
+        for kind, rows in (("Busier", normal["busier"]), ("Quieter", normal["quieter"])):
+            for label, n, expected in rows:
+                usual = f"{expected:.0f}" if expected >= 1 else ("not heard" if not expected else "under 1")
+                out.append(f'<tr><td class="tag">{kind}</td><td>{e(label)}</td><td class="num">{n:,}</td>'
+                           f'<td class="num">{usual}</td></tr>')
+        out.append("</table>")
+
     out.append("<h2>Busiest talkgroups and channels</h2><table><tr><th>Talkgroup / channel</th>"
                '<th class="num">Calls</th><th class="num">On air</th><th></th></tr>')
     top = data["talkgroups"][0][1][0] if data["talkgroups"] else 1
@@ -19562,14 +21178,21 @@ def daily_report_html(data, version=None):
 
     out.append(f"<h2>Incidents ({len(data['incidents'])})</h2>")
     if data["incidents"]:
-        out.append('<table><tr><th>Time</th><th>Length</th><th>Calls</th><th>What happened</th></tr>')
+        out.append('<table><tr><th>Time</th><th>Length</th><th>On scene</th><th>Type</th><th>Calls</th>'
+                   '<th>What happened</th></tr>')
+        type_colours = {key: (label, colour) for key, label, _c, colour in INCIDENT_TYPES}
         for inc in data["incidents"]:
             s = inc.get("summary") or {}
             minutes = (inc["end"] - inc["start"]).total_seconds() / 60
+            first = (s.get("story") or {}).get("first_on_scene")
+            type_label, type_colour = type_colours[s.get("type", "other")]
             out.append(f"<tr><td>{inc['start']:%H:%M}</td><td>{minutes:.0f} min</td>"
+                       f"<td>{'' if first is None else f'{first / 60:.0f} min'}</td>"
+                       f'<td style="color:{type_colour}">{e(type_label)}</td>'
                        f'<td class="num">{len(inc["members"])}</td>'
                        f'<td><span class="head">{e(s.get("headline", inc["title"]))}</span>'
                        + (f'<br><span class="muted">{e(" → ".join(inc["talkgroups"][:4]))}</span>')
+                       + (f'<br><i>Note: {e(inc["note"])}</i>' if inc.get("note") else "")
                        + "</td></tr>")
         out.append("</table>")
         if data["hubs"]:
@@ -19610,6 +21233,19 @@ def daily_report_html(data, version=None):
             out.append(f"<tr><td>{e(p[0][11:16])}</td><td>{place}</td><td>{e(p[3])}</td></tr>")
         out.append("</table>")
 
+    if data.get("alert_log"):
+        log = data["alert_log"]
+        kinds = Counter(a[1] for a in log)
+        out.append(f"<h2>Alerts ({len(log)})</h2><p>"
+                   + ", ".join(f"{e(ALERT_KIND_LABELS.get(k, k))}: {n}" for k, n in kinds.most_common())
+                   + '</p><table><tr><th>Time</th><th>Kind</th><th>Alert</th></tr>')
+        for a in log[-40:]:
+            out.append(f'<tr><td>{e(a[0][11:16])}</td><td class="tag">{e(ALERT_KIND_LABELS.get(a[1], a[1]))}</td>'
+                       f"<td>{e(a[2])}<br><span class=\"muted\">{e(a[3])}</span></td></tr>")
+        out.append("</table>")
+        if len(log) > 40:
+            out.append(f'<p class="muted">The last 40 of {len(log)} are shown.</p>')
+
     if data["alerts"]:
         out.append("<h2>Weather and Tone-Out alerts</h2><table><tr><th>Time</th><th>Kind</th>"
                    "<th>Channel</th><th>Details</th></tr>")
@@ -19618,8 +21254,8 @@ def daily_report_html(data, version=None):
                        f"<td>{e(a[4] or a[5])}</td></tr>")
         out.append("</table>")
     out.append('<p class="muted" style="margin-top:18px">From the reception history, unit ID log, '
-               "transcripts and places the Monitor recorded. Incidents and ten codes are worked out "
-               "automatically and can be wrong.</p></body></html>")
+               "transcripts and places the Monitor recorded. Incidents, ten codes and times on scene are "
+               "worked out automatically and can be wrong; incidents include your own fixes.</p></body></html>")
     return "".join(out)
 
 
@@ -21582,6 +23218,9 @@ class Monitor(QMainWindow):
             self.audio.mono = str(s.value("pcaudio/mono", "true")).lower() == "true"
             silence = str(s.value("pcaudio/silence_dbfs", "-50"))
             self.audio.silence_dbfs = None if silence == "off" else float(silence)
+            self.audio.stream_delay = float(s.value("pcaudio/stream_delay", 1.0))
+            self.audio.stream_transport = str(s.value("pcaudio/stream_transport", "auto"))
+            self.audio.stream_path = str(s.value("pcaudio/stream_path", SCANNER_RTSP_PATH))
         self.setWindowTitle(f"SDS100 Monitor v{VERSION}")
         icon_file = Path(__file__).with_name("sds100-monitor.svg")
         if icon_file.exists():
@@ -21614,6 +23253,9 @@ class Monitor(QMainWindow):
         self.transcriber = Transcriber(self)
         self.transcriber.transcribed.connect(self.transcript_ready)
         self.phone = PhoneNotifier(self)
+        self.alert_sounds = AlertSounds(self.settings)
+        self.coverage = CoverageLog()             # v1.1.87
+        self.incident_watch = IncidentWatch(self)   # v1.1.88
         self.unit_suggester = UnitSuggester(self)
         self.activity_watch = ActivityWatch(self)
         self.incidents_window = self.suggestions_window = self.activity_window = None
@@ -21967,6 +23609,8 @@ class Monitor(QMainWindow):
 
     def notify(self, title, text, category="alert"):
         stamp = datetime.now().strftime("%H:%M:%S")
+        if category != "test":
+            write_alert_log(category, title, text)      # v1.1.88: for the daily report
         if getattr(self, "alerts_panel", None) is not None:
             self.alerts_panel.log(f"{stamp}  {title} — {text}")
         self.statusBar().showMessage(f"🔔 {title} — {text}", 10000)
@@ -21982,12 +23626,11 @@ class Monitor(QMainWindow):
                     self.tray.show()
                 self.tray.showMessage(title, text, QSystemTrayIcon.MessageIcon.Information, 8000)
         if str(s.value("alerts/sound", "true")).lower() == "true":
-            sound = Path("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
-            if sound.exists() and shutil.which("paplay"):
-                subprocess.Popen(["paplay", str(sound)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                QApplication.beep()
+            # v1.1.85: each kind of alert plays its own sound (Tools → Alerts → Alert Sounds…).
+            sounds = getattr(self, "alert_sounds", None) or AlertSounds(s)
+            sounds.play(category, force=category == "test")
+            if sounds.last_problem:
+                self.statusBar().showMessage(f"🔔 {title} — {text}   (alert sound: {sounds.last_problem})", 10000)
         phone = getattr(self, "phone", None)
         if phone is not None and category != "test":
             phone.send(title, text, category)
@@ -22023,10 +23666,19 @@ class Monitor(QMainWindow):
         root.setMaximumHeight(160)
         layout = QVBoxLayout(root)
         controls = QHBoxLayout()
+        # v1.1.89: USB (all models) or the SDS200's network port.
+        self.link = QComboBox()
+        for key, label in CONNECTION_LINKS:
+            self.link.addItem(label, key)
+        self.link.setToolTip(
+            "USB: the scanner's USB cable (SDS100, SDS150, SDS200).\n"
+            "Network (SDS200): the SDS200's Ethernet port; enter its IP address. "
+            "Audio can come over the network too (PC AUDIO CAPTURE → INPUT).")
         self.port = QComboBox()
         self.port.setEditable(True)
         ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.port.addItems(ports or ["/dev/ttyACM0"])
+        self.usb_ports = ports or ["/dev/ttyACM0"]
+        self.port.addItems(self.usb_ports)
         self.port.setCurrentText(self.settings.value("port", "/dev/ttyACM0"))
         self.baud = QComboBox()
         self.baud.addItems(["115200", "57600", "38400", "19200", "9600"])
@@ -22039,10 +23691,17 @@ class Monitor(QMainWindow):
         self.interval.valueChanged.connect(self.change_poll_interval)
         self.connect_btn = QPushButton("CONNECT")
         self.connect_btn.clicked.connect(self.toggle)
-        for label, widget in (("Port", self.port), ("Baud", self.baud),
+        self.connection_labels = {}
+        for label, widget in (("Link", self.link), ("Port", self.port), ("Baud", self.baud),
                               ("Polling", self.interval)):
-            controls.addWidget(make_label(label))
+            self.connection_labels[label] = make_label(label)
+            controls.addWidget(self.connection_labels[label])
             controls.addWidget(widget)
+        saved_link = str(self.settings.value("link", "usb"))
+        self.link.setCurrentIndex(max(0, self.link.findData(saved_link)))
+        self.current_link = "usb"
+        self.apply_link(self.link.currentData())
+        self.link.currentIndexChanged.connect(lambda _i: self.apply_link(self.link.currentData()))
         self.push_box = QCheckBox("Push updates")
         self.push_box.setToolTip(
             "Let the scanner send its status at this interval (PSI) instead of being asked "
@@ -22064,9 +23723,9 @@ class Monitor(QMainWindow):
         controls.addWidget(self.auto_connect_box)
         self.auto_reconnect_box = QCheckBox("Reconnect automatically")
         self.auto_reconnect_box.setToolTip(
-            "If the connection drops (cable unplugged, scanner turned off or restarted, "
-            "or the scanner stops answering), keep trying to reconnect. The scanner's "
-            "port is found again even if its name changes.")
+            "If the connection drops (cable unplugged, network down, scanner turned off or "
+            "restarted, or the scanner stops answering), keep trying to reconnect. A USB "
+            "scanner's port is found again even if its name changes.")
         self.auto_reconnect_box.setChecked(
             str(self.settings.value("auto_reconnect", "true")).lower() == "true")
         self.auto_reconnect_box.toggled.connect(self.auto_reconnect_toggled)
@@ -22206,6 +23865,7 @@ class Monitor(QMainWindow):
         alerts_sub = tools_menu.addMenu("Alerts")
         alerts_sub.addAction("Activity Watch…",
                              lambda: self.open_analysis("activity_window", ActivityWatchWindow))
+        alerts_sub.addAction("Alert Sounds…", lambda: AlertSoundsDialog(self).exec())
         alerts_sub.addAction("Phone Alerts…", lambda: PhoneSettingsDialog(self).exec())
         alerts_sub.addAction("Send Calls to Rdio Scanner…", lambda: RdioDialog(self).exec())
         maps_sub = tools_menu.addMenu("Maps")
@@ -22227,6 +23887,9 @@ class Monitor(QMainWindow):
         tools_menu.addAction("Add Current Channel to Favorites List in Manager…", self.add_current_in_manager)
         tools_menu.addAction("Search Frequency in RadioReference (SDS-Manager)…",
                              lambda: self.search_frequency_in_rr(ask=True))
+        tools_menu.addSeparator()
+        tools_menu.addAction("Back Up Settings and Data…", self.back_up_settings_and_data)
+        tools_menu.addAction("Restore Settings and Data…", self.restore_settings_and_data)
         discovery_menu = self.menuBar().addMenu("Discovery")
         discovery_menu.addAction("Discovery Control…", self.open_discovery)
         self.discovery_load_action = discovery_menu.addAction(
@@ -23196,8 +24859,9 @@ class Monitor(QMainWindow):
         elif not self.stall_warned:
             self.stall_warned = True
             self.statusBar().showMessage(
-                f"The scanner hasn't answered for {quiet:.0f} s. Check the cable and "
-                "that the scanner is on.", 15000)
+                f"The scanner hasn't answered for {quiet:.0f} s. "
+                + ("Check the network and that the SDS200 is on." if self.current_link == "lan"
+                   else "Check the cable and that the scanner is on."), 15000)
 
     # ---- PC audio capture -----------------------------------------------
     def build_pc_audio(self, layout):
@@ -23209,7 +24873,8 @@ class Monitor(QMainWindow):
             "and saves each one as an MP3 with tags, plus a row in the day's CSV index.")
         self.pc_audio_device = QComboBox()
         self.pc_audio_device.setToolTip("The sound input the scanner's headphone jack is "
-                                        "connected to (line-in or USB sound card)")
+                                        "connected to (line-in or USB sound card), or "
+                                        "the SDS200's own audio over the network")
         refresh = QPushButton("↻")
         refresh.setToolTip("Refresh the list of sound inputs")
         refresh.setMaximumWidth(36)
@@ -23268,6 +24933,8 @@ class Monitor(QMainWindow):
         self.audio.saved.connect(self.audio_saved)
         self.audio.skipped.connect(lambda text: self.set_audio_status(text))
         self.audio.failed.connect(self.audio_failed)
+        self.audio.notice.connect(lambda text: self.set_audio_status(
+            text, error=not text.endswith("back.")))
         self.set_audio_status("Off. Tick the box to record each transmission.")
         if str(self.settings.value("pcaudio/enabled", "false")).lower() == "true":
             self.pc_audio_enable.setChecked(True)
@@ -23279,7 +24946,9 @@ class Monitor(QMainWindow):
         self.pc_audio_device.clear()
         for device in self.audio_devices:
             self.pc_audio_device.addItem(device.description())
-        names = [d.description() for d in self.audio_devices]
+        # v1.1.89: last entry, the SDS200's own audio over the network.
+        self.pc_audio_device.addItem(NETWORK_AUDIO_LABEL)
+        names = [d.description() for d in self.audio_devices] + [NETWORK_AUDIO_LABEL]
         if current in names:
             self.pc_audio_device.setCurrentIndex(names.index(current))
         else:
@@ -23288,7 +24957,7 @@ class Monitor(QMainWindow):
             if default.id() in ids:
                 self.pc_audio_device.setCurrentIndex(ids.index(default.id()))
         self.pc_audio_device.blockSignals(False)
-        if not self.audio_devices:
+        if not self.audio_devices and current != NETWORK_AUDIO_LABEL:
             self.set_audio_status("No sound inputs found. Connect the scanner's headphone "
                                   "jack to line-in or a USB sound card, then press ↻.", error=True)
         elif saved is None and self.pc_audio_enable.isChecked() and current not in names:
@@ -23306,6 +24975,9 @@ class Monitor(QMainWindow):
             self.set_audio_status("Off. Tick the box to record each transmission.")
             return
         index = self.pc_audio_device.currentIndex()
+        if index == len(self.audio_devices) and self.pc_audio_device.currentText() == NETWORK_AUDIO_LABEL:
+            self.start_network_audio()
+            return
         if index < 0 or index >= len(self.audio_devices):
             self.set_audio_status("Choose a sound input first.", error=True)
             self.pc_audio_enable.setChecked(False)
@@ -23316,6 +24988,24 @@ class Monitor(QMainWindow):
             self.set_audio_status(
                 f"Listening on {device.description()} ({self.audio.rate} Hz, saving "
                 f"{self.audio.bitrate} {mode} MP3). Waiting for a reception…"
+                + ("" if getattr(self, "connected", False) else " Connect to the scanner to start recording."))
+        else:
+            self.pc_audio_enable.setChecked(False)
+
+    def start_network_audio(self):
+        """INPUT → SDS200 network audio: record the scanner's RTSP stream."""
+        try:
+            url = rtsp_url(self.lan_address(), self.audio.stream_path)
+        except ValueError:
+            self.set_audio_status("Network audio needs the SDS200's IP address: choose Link → "
+                                  "Network (SDS200) at the top and enter it.", error=True)
+            self.pc_audio_enable.setChecked(False)
+            return
+        if self.audio.start_stream(url):
+            mode = "mono"
+            self.set_audio_status(
+                f"Listening to {url} (saving {self.audio.bitrate} {mode} MP3). "
+                "Waiting for a reception…"
                 + ("" if getattr(self, "connected", False) else " Connect to the scanner to start recording."))
         else:
             self.pc_audio_enable.setChecked(False)
@@ -23922,12 +25612,13 @@ class Monitor(QMainWindow):
             if model.upper().startswith("SDS200"):
                 self.audio_sliders["VOL"].setMaximum(29)
                 self.audio_sliders["SQL"].setMaximum(19)
-            if model.upper().startswith("SDS100"):
+            if model.upper().startswith(("SDS100", "SDS150", "SDS200")):
                 set_text(self.scanner_label, f"Scanner: {model}")
             else:
-                set_text(self.scanner_label, f"Scanner: {model} (not an SDS100?)")
+                set_text(self.scanner_label, f"Scanner: {model} (not an SDS100/150/200?)")
                 self.statusBar().showMessage(
-                    f"Connected device reports model '{model}'; this program is written for the SDS100.", 15000)
+                    f"Connected device reports model '{model}'; this program is written for the "
+                    "SDS100, SDS150 and SDS200.", 15000)
         elif reply.startswith("REPLY: VER,"):
             version = reply[len("REPLY: VER,"):].strip()
             set_text(self.scanner_label, f"Scanner: {getattr(self, 'scanner_model', 'SDS100')} • firmware {version}")
@@ -24620,6 +26311,50 @@ class Monitor(QMainWindow):
         set_text(self.update_label, text)
         self.update_label.setToolTip(tip)
 
+    def apply_link(self, link):
+        """Switch the connection row between USB (port, baud) and network (address)."""
+        if self.thread and self.thread.isRunning() and link != self.current_link:
+            # Can't change the link of a live connection; put the choice back.
+            self.link.blockSignals(True)
+            self.link.setCurrentIndex(max(0, self.link.findData(self.current_link)))
+            self.link.blockSignals(False)
+            self.statusBar().showMessage("Disconnect first to change between USB and network.", 6000)
+            return
+        previous = self.current_link
+        if previous != link:
+            # Keep what was typed for the other link.
+            key = "lan_address" if previous == "lan" else "port"
+            self.settings.setValue(key, self.port.currentText().strip())
+        self.current_link = link
+        lan = link == "lan"
+        self.port.blockSignals(True)
+        self.port.clear()
+        if lan:
+            saved = str(self.settings.value("lan_address", ""))
+            if saved:
+                self.port.addItem(saved)
+            self.port.setCurrentText(saved)
+            self.port.lineEdit().setPlaceholderText("IP address, e.g. 192.168.1.50")
+            self.port.setToolTip("The SDS200's IP address (Settings → Network on the scanner). "
+                                 f"Add :port if it isn't the usual UDP {SCANNER_UDP_PORT}.")
+        else:
+            self.port.addItems(self.usb_ports)
+            self.port.setCurrentText(str(self.settings.value("port", "/dev/ttyACM0")))
+            self.port.lineEdit().setPlaceholderText("")
+            self.port.setToolTip("The scanner's USB serial port")
+        self.port.blockSignals(False)
+        self.port.setMinimumContentsLength(16 if lan else 0)
+        set_text(self.connection_labels["Port"], "Address" if lan else "Port")
+        self.baud.setVisible(not lan)
+        self.connection_labels["Baud"].setVisible(not lan)
+        self.settings.setValue("link", link)
+
+    def lan_address(self):
+        """The SDS200 address typed or saved, for network audio as well as control."""
+        if getattr(self, "current_link", "usb") == "lan":
+            return self.port.currentText().strip()
+        return str(self.settings.value("lan_address", "")).strip()
+
     def toggle(self):
         if self.thread and self.thread.isRunning():
             self.user_stopped = True
@@ -24637,7 +26372,14 @@ class Monitor(QMainWindow):
         self.user_stopped = False
         self.auto_attempt = auto
         self.had_connection = False
-        if auto:
+        lan = self.current_link == "lan"
+        if lan:
+            try:
+                parse_lan_address(self.port.currentText())
+            except ValueError as exc:
+                QMessageBox.warning(self, "Network connection", str(exc))
+                return
+        if auto and not lan:
             # After a replug the scanner can reappear under another name.
             port = find_scanner_port(self.port.currentText().strip())
             if port != self.port.currentText().strip():
@@ -24649,7 +26391,7 @@ class Monitor(QMainWindow):
         self.active_poll_ms = self.interval.value()
         self.thread = ScannerThread(self.port.currentText().strip(),
                                     int(self.baud.currentText()),
-                                    self.interval.value())
+                                    self.interval.value(), link=self.current_link)
         self.thread.push_ms = self.interval.value() if self.push_box.isChecked() else 0
         self.update_state = "poll"
         self.thread.xml_received.connect(self.process_xml)
@@ -24740,14 +26482,20 @@ class Monitor(QMainWindow):
             self.gps.connection_changed(True)
             self.antenna_test.connection_changed(True)
             self.update_connect_button()
+            # Network audio follows the address just connected to (v1.1.89).
+            if (self.audio is not None and self.audio.streaming and self.current_link == "lan"
+                    and self.audio.stream_url != rtsp_url(self.lan_address(), self.audio.stream_path)):
+                self.start_network_audio()
         elif message.startswith("ERROR:"):
             if self.auto_reconnect_box.isChecked() and (self.auto_attempt or self.had_connection):
                 # No dialog while reconnecting automatically; it would pile up.
                 self.statusBar().showMessage(message.splitlines()[0], 10000)
                 return
-            QMessageBox.warning(self, "Serial error", message)
+            QMessageBox.warning(self, "Network error" if self.current_link == "lan"
+                                else "Serial error", message)
         set_text(self.status, message)
-        set_css(self.status, "color:#52dc95;" if message == "CONNECTED" else "color:#ed8b8b;")
+        set_css(self.status, "color:#52dc95;" if message == "CONNECTED" else
+                "color:#e6a65a;" if message.startswith("Contacting") else "color:#ed8b8b;")
 
     @staticmethod
     def attr(node, key, default="—"):
@@ -24755,6 +26503,7 @@ class Monitor(QMainWindow):
 
     def process_xml(self, xml):
         self.last_rx = time.monotonic()
+        self.coverage.mark()                    # v1.1.87: listening time for the daily report
         self.console.output_xml("GSI", xml)
         try:
             root = ET.fromstring(xml)
@@ -25144,8 +26893,44 @@ class Monitor(QMainWindow):
         # Refreshes always show the leading statistics rows.
         self.stats_table.verticalScrollBar().setValue(0)
 
+    # ---- Back up and restore (v1.1.86) ----
+    def back_up_settings_and_data(self):
+        BackupDialog(self).exec()
+
+    def restore_settings_and_data(self):
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a backup", str(BACKUP_DIR), "Backups (*.zip)")
+        if not path:
+            return
+        try:
+            manifest = read_backup(path)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Not a backup", str(e))
+            return
+        dialog = RestoreDialog(self, path, manifest)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.parts():
+            return
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if Path(path).resolve() != PENDING_RESTORE.resolve():
+            shutil.copy2(path, PENDING_RESTORE)
+        PENDING_CHOICES.write_text(json.dumps({"parts": dialog.parts(), "source": str(path)}), encoding="utf-8")
+        self.restart_after_restore = True              # applied in __main__ once everything is saved
+        self.close()
+
+    def report_restore(self):
+        """At start: tell what the last restore did."""
+        try:
+            result = json.loads(RESTORE_RESULT.read_text(encoding="utf-8"))
+            RESTORE_RESULT.unlink()
+        except (OSError, ValueError):
+            return
+        title, text = restore_report(result)
+        (QMessageBox.warning if result.get("error") else QMessageBox.information)(self, title, text)
+
     def save_settings(self):
-        self.settings.setValue("port", self.port.currentText())
+        self.settings.setValue("link", self.current_link)
+        self.settings.setValue("lan_address" if self.current_link == "lan" else "port",
+                               self.port.currentText())
         self.settings.setValue("baud", self.baud.currentText())
         self.settings.setValue("poll_ms", self.interval.value())
         self.settings.setValue("geometry", self.saveGeometry())
@@ -25186,6 +26971,9 @@ class Monitor(QMainWindow):
             self.settings.setValue("pcaudio/mono", "true" if a.mono else "false")
             self.settings.setValue("pcaudio/silence_dbfs",
                                    "off" if a.silence_dbfs is None else a.silence_dbfs)
+            self.settings.setValue("pcaudio/stream_delay", a.stream_delay)
+            self.settings.setValue("pcaudio/stream_transport", a.stream_transport)
+            self.settings.setValue("pcaudio/stream_path", a.stream_path)
             self.settings.setValue("pcaudio/enabled", self.pc_audio_enable.isChecked())
             if self.pc_audio_device.currentIndex() >= 0:
                 self.settings.setValue("pcaudio/device", self.pc_audio_device.currentText())
@@ -25230,6 +27018,438 @@ class Monitor(QMainWindow):
         if self.macro_keypad.window is not None:
             self.macro_keypad.window.hide()
         event.accept()
+
+
+# ---- Back up and restore (v1.1.86) ---------------------------------------------------------------
+#
+# Tools → Back Up Settings and Data… puts the settings and the data folder into one .zip, for a reinstall or
+# another computer; Tools → Restore Settings and Data… puts them back. The settings are a live file the Monitor
+# rewrites as it closes, so a restore is applied as the Monitor closes (after everything is saved) and the
+# Monitor starts again. Files in the backup replace the ones here with the same name; anything replaced is
+# kept first in backups/ as "Before restore …zip", which is itself a backup that can be restored.
+
+BACKUP_FORMAT = "sds100-monitor-backup-v1"
+BACKUP_DIR = DATA_DIR / "backups"
+PENDING_RESTORE = DATA_DIR / "restore-pending.zip"
+PENDING_CHOICES = DATA_DIR / "restore-pending.json"
+RESTORE_RESULT = DATA_DIR / "restore-result.json"
+PROGRAM_FILE = os.path.abspath(__file__)
+BACKUP_PARTS = [
+    ("settings", "Settings",
+     "every setting, with unit names, the information panel, ten codes, Close Call notes, your fixes to "
+     "incidents and your own alert sound files"),
+    ("history", "History and logs",
+     "receptions, unit IDs, activity, site health, channel load, listening time, places, aircraft, antenna "
+     "tests and reports"),
+    ("recordings", "Recordings", "recorded audio (can be large)"),
+]
+BACKUP_SETTINGS_FILES = {"unit_names.csv", "info_panel.json", "ten_codes.json", "close_call_frequencies.json",
+                         "incident_edits.json"}
+BACKUP_RECORDING_DIRS = {"audio"}
+NOT_BACKED_UP = {"transcribe-engine", "backups", "widget.json", "rdio_queue.json", "restore-pending.zip",
+                 "restore-pending.json", "restore-result.json"}
+
+
+def settings_file_path():
+    """Where Qt keeps QSettings("SDS100Monitor", "Monitor110") on Linux."""
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "SDS100Monitor" / "Monitor110.conf"
+
+
+def backup_part_of(rel):
+    """Which part a file of the data folder (relative path, with /) belongs to; None if never backed up."""
+    top = rel.split("/", 1)[0]
+    if top in NOT_BACKED_UP or top.endswith(".part"):
+        return None
+    if rel in BACKUP_SETTINGS_FILES:
+        return "settings"
+    if top in BACKUP_RECORDING_DIRS:
+        return "recordings"
+    return "history"
+
+
+def backup_data_files(data_dir=None):
+    """{part: [(relative path, path)]} for the files of the data folder."""
+    data_dir = Path(data_dir or DATA_DIR)
+    found = {key: [] for key, _, _ in BACKUP_PARTS}
+    if not data_dir.is_dir():
+        return found
+    for path in sorted(data_dir.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        rel = path.relative_to(data_dir).as_posix()
+        part = backup_part_of(rel)
+        if part:
+            found[part].append((rel, path))
+    return found
+
+
+def own_sound_files(settings):
+    """{alert kind: path} for alert sounds that are files of your own and exist."""
+    found = {}
+    if settings is None:
+        return found
+    for kind, _ in ALERT_SOUND_KINDS:
+        c = clean_sound_choice(settings.value(f"alertsounds/{kind}", ""))
+        if c["source"] == "file" and c["sound"]:
+            path = Path(c["sound"]).expanduser()
+            if path.is_file():
+                found[kind] = path
+    return found
+
+
+def backup_size_text(size):
+    size = float(size)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{int(size)} bytes" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_backup(target, entries, parts, data_dir, sounds=None, note="", version=None, now=None):
+    """entries: [(path, name in the zip, part)]. Written beside the target first, then moved into place."""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".part")
+    files = {}
+    try:
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as z:
+            for path, name, part in entries:
+                stored = part == "recordings"                    # audio is compressed already
+                z.write(path, name, compress_type=zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED)
+                files[name] = {"size": Path(path).stat().st_size, "sha256": _file_sha256(path), "part": part}
+            manifest = {"format": BACKUP_FORMAT, "program": "SDS100 Monitor", "version": version or VERSION,
+                        "created": (now or datetime.now()).astimezone().isoformat(timespec="seconds"),
+                        "data_dir": str(data_dir), "parts": sorted(parts), "note": note,
+                        "files": files, "sounds": sounds or {}}
+            z.writestr("manifest.json", json.dumps(manifest, indent=1))
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return manifest
+
+
+def make_backup(target, parts, settings_file=None, settings=None, data_dir=None, now=None):
+    """Back up the chosen parts into the .zip `target`. Returns the manifest."""
+    parts = {p for p in parts if p in {key for key, _, _ in BACKUP_PARTS}}
+    if not parts:
+        raise ValueError("Choose something to back up.")
+    data_dir = Path(data_dir or DATA_DIR)
+    target = Path(target)
+    entries, sounds = [], {}
+    if "settings" in parts:
+        settings_file = Path(settings_file or settings_file_path())
+        if settings_file.is_file():
+            entries.append((settings_file, "settings/Monitor110.conf", "settings"))
+        for kind, path in own_sound_files(settings).items():
+            name = f"sounds/{kind}-{path.name}"
+            entries.append((path, name, "settings"))
+            sounds[kind] = {"path": str(path), "file": name}
+    skip = {target.resolve(), target.with_name(target.name + ".part").resolve()}
+    for part, items in backup_data_files(data_dir).items():
+        if part in parts:
+            entries += [(path, "data/" + rel, part) for rel, path in items if path.resolve() not in skip]
+    return _write_backup(target, entries, parts, data_dir, sounds, now=now)
+
+
+def _safe_backup_name(name):
+    parts = name.split("/")
+    return (not name.startswith("/") and "\\" not in name and ".." not in parts and "" not in parts
+            and parts[0] in ("settings", "data", "sounds") and len(parts) > 1)
+
+
+def read_backup(path):
+    """The manifest of a backup, after checking it is one and that every file in it is listed and safe."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            if "manifest.json" not in names:
+                raise ValueError("This is not an SDS100 Monitor backup (it has no manifest.json).")
+            manifest = json.loads(z.read("manifest.json").decode("utf-8"))
+    except zipfile.BadZipFile:
+        raise ValueError("This file is not a .zip backup, or it is damaged.")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("The backup's manifest.json can't be read.")
+    if not isinstance(manifest, dict) or manifest.get("format") != BACKUP_FORMAT:
+        raise ValueError("This is not an SDS100 Monitor backup, or it was made by a newer version.")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("The backup's list of files is missing.")
+    for name in files:
+        if not _safe_backup_name(name):
+            raise ValueError(f"The backup holds a file with an unsafe name: {name}")
+        if name not in names:
+            raise ValueError(f"The backup is incomplete: {name} is missing.")
+    return manifest
+
+
+def backup_part_counts(manifest):
+    """{part: (files, bytes)} of a backup."""
+    counts = {}
+    for info in manifest["files"].values():
+        n, size = counts.get(info.get("part"), (0, 0))
+        counts[info.get("part")] = (n + 1, size + int(info.get("size", 0)))
+    return counts
+
+
+def plan_restore(manifest, parts, settings_file=None, data_dir=None):
+    """[(name in the zip, where it goes, "add" | "replace" | "same")] for the chosen parts. Sound files are
+    placed by apply_restore."""
+    data_dir = Path(data_dir or DATA_DIR)
+    settings_file = Path(settings_file or settings_file_path())
+    plan = []
+    for name, info in sorted(manifest["files"].items()):
+        if info.get("part") not in parts or name.startswith("sounds/"):
+            continue
+        dest = settings_file if name.startswith("settings/") else data_dir / name[len("data/"):]
+        if not dest.is_file():
+            action = "add"
+        elif dest.stat().st_size == info.get("size") and _file_sha256(dest) == info.get("sha256"):
+            action = "same"
+        else:
+            action = "replace"
+        plan.append((name, dest, action))
+    return plan
+
+
+def apply_restore(path, parts, settings_file=None, data_dir=None, make_settings=None, now=None):
+    """Put the chosen parts of a backup back. make_settings(path) opens a settings file (QSettings in the
+    program) to point alert sounds and paths in the data folder at where they are on this computer."""
+    manifest = read_backup(path)
+    parts = set(parts) & set(manifest.get("parts", []))
+    if not parts:
+        raise ValueError("Nothing was chosen to restore.")
+    data_dir = Path(data_dir or DATA_DIR)
+    settings_file = Path(settings_file or settings_file_path())
+    now = now or datetime.now()
+    plan = plan_restore(manifest, parts, settings_file, data_dir)
+    replaced = [(dest, name, manifest["files"][name]["part"]) for name, dest, action in plan if action == "replace"]
+    safety = None
+    if replaced:
+        safety = Path(data_dir) / "backups" / f"Before restore {now:%Y-%m-%d %H%M%S}.zip"
+        n = 2
+        while safety.exists() or safety.resolve() == Path(path).resolve():
+            safety = safety.with_name(f"Before restore {now:%Y-%m-%d %H%M%S} ({n}).zip")
+            n += 1
+        _write_backup(safety, replaced, {p for _, _, p in replaced}, data_dir,
+                      note="Files a restore replaced, saved first.", now=now)
+    written = 0
+    moved_sounds = []
+    with zipfile.ZipFile(path) as z:
+        def put(name, dest):
+            data = z.read(name)
+            if hashlib.sha256(data).hexdigest() != manifest["files"][name]["sha256"]:
+                raise ValueError(f"{name} in the backup is damaged (its checksum does not match).")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            temporary = dest.with_name(dest.name + ".restoring")
+            temporary.write_bytes(data)
+            os.replace(temporary, dest)
+        for name, dest, action in plan:
+            if action != "same":
+                put(name, dest)
+                written += 1
+        settings = make_settings(settings_file) if make_settings and "settings" in parts else None
+        if "settings" in parts:
+            for kind, info in (manifest.get("sounds") or {}).items():
+                name, original = info.get("file", ""), Path(info.get("path", ""))
+                if name not in manifest["files"]:
+                    continue
+                if original.is_file() and _file_sha256(original) == manifest["files"][name]["sha256"]:
+                    continue                                          # the same file is here already
+                dest = data_dir / "sounds" / name.split("/", 1)[1]
+                put(name, dest)
+                written += 1
+                moved_sounds.append(str(dest))
+                if settings is not None:
+                    key = f"alertsounds/{kind}"
+                    choice = clean_sound_choice(settings.value(key, ""))
+                    if choice["source"] == "file":
+                        choice["sound"] = str(dest)
+                        settings.setValue(key, json.dumps(choice))
+        old_dir = str(manifest.get("data_dir") or "")
+        if settings is not None and old_dir and old_dir != str(data_dir):
+            for key in list(settings.allKeys()):
+                value = settings.value(key)
+                if isinstance(value, str) and old_dir in value:
+                    settings.setValue(key, value.replace(old_dir, str(data_dir)))
+        if settings is not None:
+            settings.sync()
+    return {"written": written, "same": sum(1 for *_, a in plan if a == "same"),
+            "replaced": len(replaced), "safety": str(safety) if safety else "", "sounds": moved_sounds,
+            "parts": sorted(parts), "backup": str(path)}
+
+
+def run_pending_restore(settings_file=None, make_settings=None):
+    """Apply a restore chosen in the Monitor (called as it closes, and at start in case it didn't finish).
+    The result is left for the next start to report."""
+    if not PENDING_RESTORE.is_file():
+        return None
+    try:
+        choices = json.loads(PENDING_CHOICES.read_text(encoding="utf-8"))
+        result = apply_restore(PENDING_RESTORE, choices.get("parts", []), settings_file,
+                               make_settings=make_settings)
+        result["backup"] = choices.get("source", result["backup"])
+    except Exception as e:                                   # reported at the next start; never a crash loop
+        result = {"error": str(e)}
+    for f in (PENDING_RESTORE, PENDING_CHOICES):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    try:
+        RESTORE_RESULT.write_text(json.dumps(result, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    return result
+
+
+def restore_report(result):
+    """(title, text) telling what a restore did."""
+    if result.get("error"):
+        return "Restore failed", ("The settings and data could not be restored:\n\n" + result["error"] +
+                                  "\n\nFiles put back before the problem stay put back; anything they replaced was saved "
+                                  "first in backups/ as \"Before restore …\".")
+    text = f"Restored from {Path(result.get('backup', '')).name}: {result.get('written', 0):,} files put back"
+    if result.get("same"):
+        text += f", {result['same']:,} already the same"
+    text += "."
+    if result.get("safety"):
+        text += (f"\n\nThe {result.get('replaced', 0):,} files it replaced were saved first in "
+                 f"{result['safety']}; restore that to put them back.")
+    if result.get("sounds"):
+        text += "\n\nYour own alert sounds were put in " + str(Path(result["sounds"][0]).parent) + "."
+    return "Restore finished", text
+
+
+class BackupDialog(QDialog):
+    """Tools → Back Up Settings and Data…"""
+
+    def __init__(self, monitor, parent=None):
+        super().__init__(parent or monitor)
+        self.monitor = monitor
+        self.setWindowTitle("Back up settings and data")
+        layout = QVBoxLayout(self)
+        intro = make_label("A backup is one .zip file. Keep it to set the Monitor up again after a reinstall or "
+                           "on another computer, with Tools → Restore Settings and Data…. It holds the settings "
+                           "as they are, including passwords and tokens for phone alerts and Rdio Scanner, so "
+                           "keep it somewhere private.")
+        intro.setWordWrap(True)
+        intro.setMinimumWidth(520)
+        set_css(intro, "color:#a5bdd2;")
+        layout.addWidget(intro)
+        files = backup_data_files()
+        sounds = own_sound_files(monitor.settings)
+        self.boxes = {}
+        for key, title, detail in BACKUP_PARTS:
+            count = len(files[key]) + (len(sounds) + 1 if key == "settings" else 0)
+            size = sum(p.stat().st_size for _, p in files[key])
+            box = QCheckBox(f"{title}: {detail} ({count:,} files, {backup_size_text(size)})")
+            box.setChecked(key != "recordings")
+            box.toggled.connect(self.update_button)
+            self.boxes[key] = box
+            layout.addWidget(box)
+        note = make_label("The transcription engine is not included; it can be set up again.")
+        set_css(note, "color:#a5bdd2;")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok.setText("BACK UP…")
+        buttons.accepted.connect(self.back_up)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.adjustSize()
+
+    def parts(self):
+        return [key for key, box in self.boxes.items() if box.isChecked()]
+
+    def update_button(self, *_):
+        self.ok.setEnabled(bool(self.parts()))
+
+    def back_up(self):
+        suggested = BACKUP_DIR / f"SDS100 Monitor backup {datetime.now():%Y-%m-%d %H%M}.zip"
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(self, "Save the backup", str(suggested), "Backups (*.zip)")
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        self.monitor.save_settings()                   # the settings file as they are now
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            manifest = make_backup(path, self.parts(), Path(self.monitor.settings.fileName()),
+                                   self.monitor.settings)
+        except (OSError, ValueError) as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Backup failed", f"The backup could not be made:\n\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "Backup made",
+                                f"{len(manifest['files']):,} files backed up "
+                                f"({backup_size_text(Path(path).stat().st_size)}) in\n{path}")
+        self.accept()
+
+
+class RestoreDialog(QDialog):
+    """Tools → Restore Settings and Data…, after choosing the backup."""
+
+    def __init__(self, monitor, path="", manifest=None, parent=None):
+        super().__init__(parent or monitor)
+        manifest = manifest or {"files": {}, "parts": []}
+        self.monitor, self.path, self.manifest = monitor, path, manifest
+        self.setWindowTitle("Restore settings and data")
+        layout = QVBoxLayout(self)
+        made = str(manifest.get("created", ""))[:16].replace("T", " ")
+        head = make_label(f"{Path(path).name}\nmade {made} by SDS100 Monitor {manifest.get('version', '')}")
+        set_css(head, "font-weight:700;")
+        layout.addWidget(head)
+        counts = backup_part_counts(manifest)
+        self.boxes = {}
+        for key, title, detail in BACKUP_PARTS:
+            if key not in manifest.get("parts", []):
+                continue
+            n, size = counts.get(key, (0, 0))
+            box = QCheckBox(f"{title} ({n:,} files, {backup_size_text(size)})")
+            box.setChecked(True)
+            box.toggled.connect(self.update_plan)
+            self.boxes[key] = box
+            layout.addWidget(box)
+        self.plan_label = make_label("")
+        self.plan_label.setWordWrap(True)
+        layout.addWidget(self.plan_label)
+        note = make_label("Files in the backup replace the ones here with the same name; everything else here "
+                          "stays. Anything replaced is saved first in backups/ as \"Before restore …\". The "
+                          "Monitor closes to restore and then starts again.")
+        note.setWordWrap(True)
+        note.setMinimumWidth(520)
+        set_css(note, "color:#a5bdd2;")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok.setText("RESTORE AND RESTART")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.update_plan()
+        self.adjustSize()
+
+    def parts(self):
+        return [key for key, box in self.boxes.items() if box.isChecked()]
+
+    def update_plan(self, *_):
+        plan = plan_restore(self.manifest, self.parts(), Path(self.monitor.settings.fileName()))
+        count = Counter(action for *_, action in plan)
+        set_text(self.plan_label, f"{count['add']:,} files to add, {count['replace']:,} to replace, "
+                                  f"{count['same']:,} already the same.")
+        self.ok.setEnabled(bool(self.parts()))
 
 
 APP_ID = "sds100-monitor"        # matches /usr/share/applications/sds100-monitor.desktop
@@ -25281,6 +27501,8 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     if not os.environ.get("SDS100_MONITOR_TEST_CLOSE_MS") and bring_forward_running():
         os._exit(0)
+    # 1.1.86: a restore that did not finish as the Monitor closed is applied now, before the settings are read.
+    run_pending_restore(make_settings=lambda f: QSettings(str(f), QSettings.Format.IniFormat))
     saved = QSettings("SDS100Monitor", "Monitor110")
     THEME = Theme(str(saved.value("theme/mode", "dark")), str(saved.value("theme/accent", "blue")),
                   str(saved.value("theme/size", "normal")), system_is_dark())
@@ -25289,6 +27511,7 @@ if __name__ == "__main__":
     app.aboutToQuit.connect(window.transcriber.shutdown)
     window.show()
     window.instance_server = listen_for_second_start(window)
+    QTimer.singleShot(0, window.report_restore)
     if os.environ.get("SDS100_MONITOR_TEST_CLOSE_MS"):        # used by tests/test_real_qt.py
         QTimer.singleShot(int(os.environ["SDS100_MONITOR_TEST_CLOSE_MS"]), window.close)
     code = app.exec()
@@ -25297,6 +27520,16 @@ if __name__ == "__main__":
     # by one crashes PyQt6 on Python 3.14 (segmentation fault in sip during Py_Exit, v1.1.47/48).
     window.settings.sync()
     saved.sync()
+    # 1.1.86: Tools → Restore Settings and Data… is applied here, after everything above is saved, so nothing
+    # writes the old settings back over it; then the Monitor starts again.
+    if run_pending_restore(window.settings.fileName(),
+                           lambda f: QSettings(str(f), QSettings.Format.IniFormat)) is not None:
+        if getattr(window, "restart_after_restore", False):
+            if getattr(window, "instance_server", None) is not None:
+                window.instance_server.close()         # so the new Monitor doesn't find this one
+            subprocess.Popen([sys.executable, PROGRAM_FILE], cwd=os.path.dirname(PROGRAM_FILE), start_new_session=True,
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)

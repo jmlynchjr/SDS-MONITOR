@@ -7,7 +7,7 @@
         "Category": "Utilities",
         "Authors": [{ "Name": "J. Lynch" }],
         "License": "GPL-3.0-or-later",
-        "Version": "1.1.84",
+        "Version": "1.1.89",
         "Website": "https://github.com/jmlynchjr/SDS-MONITOR"
     },
     "KPackageStructure": "Plasma/Applet",

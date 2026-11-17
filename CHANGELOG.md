@@ -2,6 +2,72 @@
 
 Newest first. Versions before 1.1.47 were tested by hand on a real SDS100; from 1.1.47 on, every version also passes the automated tests.
 
+## v1.1.89: SDS200 over the network
+
+- **New: connect to an SDS200 over its Ethernet port.** At the top, **Link** chooses **USB** (all models, as before) or **Network (SDS200)**. On Network, type the SDS200's IP address (from the scanner's network settings) where the port was; add `:port` only if it isn't the usual UDP 50536. Baud is hidden on Network.
+  - Everything that works over USB works the same over the network: the information panel, keypad, waterfall, push updates, Discovery, Analyze, the scanner menu and the rest. The Monitor sends the same commands; only the cable is different.
+  - Connecting checks that the scanner answers (for up to 3 seconds). A wrong address or a scanner that is off gives an error, and with **Reconnect automatically** the Monitor keeps trying (5, 10 … 30 s apart), as it does when a USB cable is unplugged. If the scanner stops answering for 15 s, the Monitor reconnects.
+  - The USB port and the network address are kept separately, so changing **Link** back and forth doesn't lose either. Change **Link** after disconnecting.
+- **New: SDS200 network audio.** In PC AUDIO CAPTURE, **INPUT** has a new last entry, **SDS200 network audio (RTSP)**: recordings, transcription, Rdio Scanner uploads and everything else that uses recorded audio then take the SDS200's own audio stream instead of a sound card, with no audio cable. It uses the address in **Link → Network**; ffmpeg receives the stream.
+  - The stream reaches the PC a little after the scanner reports a reception, so recording carries on longer (**SETTINGS… → SDS200 network audio → Extra delay**, 1 s to begin with). **Transport** (Automatic, UDP or TCP) and the stream's name (normally `au:scanner.au`) are there too.
+  - If the stream drops or goes silent for 10 s, it is started again by itself (5, 10 … 30 s apart), and the status line says so.
+- The scanner line now accepts the SDS150 and SDS200 by name instead of asking *not an SDS100?*.
+- **Not tested on a real SDS200 yet.** The network link and audio were checked against a simulated SDS200 on the PC and the real ffmpeg; the SDS100 and SDS150 over USB work as before.
+- New tests (16).
+
+## v1.1.88: Incident types, notes, an alert when an incident grows, and alerts in the daily report
+
+- **New: incident types.** Each incident is *Fire*, *EMS*, *Law*, *Traffic*, *Weather / hazard* or *Other*, worked out from words (no AI): what was said and the ten codes' meanings count twice, the department and channel names once; unit call signs such as *Engine 12* don't count. On a tie, Traffic comes first, then Fire, Law and EMS.
+  - A coloured **Type** column, a type filter beside Search, and counts in the line above the list (*By type: 3 fire, 2 EMS*).
+  - Right-click → **Set Type** to choose it yourself (or back to *Automatic*); it is kept with your other fixes.
+- **New: notes.** Right-click an incident → **Note…** for your own note. It shows under the headline, in the Notes column, in Export and in the daily report, and Search finds it. **Undo My Changes** keeps your note.
+- **New: an alert when an incident grows.** In the Incidents window, tick **Alert when an incident going on now reaches [5] units or more than one agency**. Today's incidents are worked out every two minutes in the background (your fixes included), and each incident alerts once for each reason while it is still going (a call in the last 10 minutes). It has its own sound in **Alert Sounds** (*Incidents: an incident grows*) and its own tick in **Phone Alerts** (off to begin with).
+- **Daily report:** incidents by type in the summary, a **Type** column, your notes under the headlines, and a new **Alerts** section: every alert the Monitor gave that day (unusual activity, new talkgroups and radios, Close Call, aircraft, keywords, alert rules, growing incidents), counted by kind, with the last 40 listed. Weather and Tone-Out stay in their own section.
+- Every alert is now also written to `~/SDS100Monitor/alerts/alerts_YYYY-MM-DD.csv` (included in backups with the history).
+- New tests (11).
+
+## v1.1.87: Fix incidents, what happened step by step, and a fuller daily report
+
+- **New: fix incidents yourself** in History → Incidents… (right-click):
+  - on an incident: **Edit Headline…**, **Merge with Another Incident…** (the nearest are listed first), **Hide (Not an Incident)** and **Undo My Changes to This Incident**;
+  - on a call in the timeline: **Take This Call Out of the Incident** and **Start a New Incident from This Call**.
+  - Your fixes are kept for each day (in `incident_edits.json`) and used everywhere incidents appear: the Incidents window, Search Everything and the daily report. An incident you changed is kept even if it has fewer calls than *At least … calls*, and its notes say *changed by you*. **Show hidden** lists hidden incidents again.
+- **New: what happened, step by step.** Under an incident's headline: how it started (the talkgroup and the first words said), moves to other talkgroups or systems, and when each unit was en route, on scene, transporting and back in service, from its calls' ten codes and words. It ends with one sentence, for example *24 min, 12 calls, 3 units; first on scene after 6 min (Engine 12)*. It's in **EXPORT INCIDENT…** too.
+- **New: time to first unit on scene**, as an **On scene** column in Incidents and in the daily report, with the median for the day.
+- **Daily report:**
+  - **Listening:** how long the Monitor was reading the scanner, and when (for example *18 h 20 min (00:00–02:10, 06:05–23:59)*), so a quiet day can be told from a day the Monitor was off. The Monitor now notes each minute it is reading the scanner, in `~/SDS100Monitor/coverage/`; days before this version show the hours with calls instead.
+  - **Compared with normal:** calls in the hours listened to against the same hours on the previous 28 days (after 5 days of history), and a section listing the talkgroups much busier or quieter than usual.
+  - **First unit on scene** in the summary, and an **On scene** column for each incident. Hidden incidents are left out, and your own headlines are used.
+- Backups (Tools → Back Up Settings and Data…) include your incident fixes with the settings, and the listening record with the history.
+- New tests (17).
+
+## v1.1.86: Back up and restore settings and data
+
+- **New: Tools → Back Up Settings and Data…** puts the Monitor's settings and data in one .zip file, for a reinstall or another computer. Tick what goes in:
+  - **Settings:** every setting (alerts, alert sounds, phone alerts, Rdio Scanner, keypad, windows and the rest), with unit names, the information panel, ten codes, Close Call notes and your own alert sound files.
+  - **History and logs:** receptions, unit IDs, activity, site health, channel load, places, aircraft, antenna tests and reports.
+  - **Recordings:** recorded audio (not ticked to begin with; it can be large).
+  - Each shows how many files and how much space. The backup goes in ~/SDS100Monitor/backups unless you choose somewhere else (a USB stick, say). It holds passwords and tokens as they are in the settings, so keep it private. The transcription engine is not included.
+- **New: Tools → Restore Settings and Data…** chooses a backup, shows when and by which version it was made, and lets you tick which parts to put back, with how many files will be added, replaced or are already the same.
+  - Files in the backup replace the ones here with the same name; everything else stays. Anything replaced is saved first in backups/ as *Before restore …zip*, which can be restored like any backup.
+  - The Monitor closes, restores (after everything it was doing is saved, so nothing writes the old settings back), and starts again, then says what was restored.
+  - On another computer, your own alert sounds are put in ~/SDS100Monitor/sounds if they aren't where they were, and settings that pointed into the old data folder point into the new one.
+  - Every file is checked against the backup's checksums; a damaged or unknown file is refused, and nothing outside the data folder and the settings file is written.
+- New tests (19).
+
+## v1.1.85: A sound for each kind of alert
+
+- **New: Tools → Alerts → Alert Sounds…** chooses what each kind of desktop alert plays, all on one page (also **SOUNDS…** beside the Sound box in Scanner Tools → Alerts):
+  - Activity Watch (unusual activity, new talkgroup, new radio, radio back), Tone-Out, Weather Alert (SAME / FIPS), Close Call, Aircraft (ADS-B: emergency squawks and watched aircraft), keyword alerts and other alert rules.
+  - For each: one of the system's sounds (the sound themes in /usr/share/sounds, such as KDE's Ocean and freedesktop, and your own in ~/.local/share/sounds), a sound file of your own (.wav, .ogg, .oga, .flac or .mp3), or None.
+  - A volume for each (0–100%) and a **TEST** button that plays it as an alert would.
+  - **USE ONE SOUND FOR ALL…** copies one alert's sound and volume to the others; **RESET TO DEFAULTS** puts every alert back to the system's message sound at full volume.
+  - **Play a sound with alerts** at the top is the same switch as the Sound box in Scanner Tools → Alerts: off means every alert is silent.
+- Nothing changes until you choose: every alert starts with the sound all alerts played before (freedesktop's *message-new-instant*, full volume).
+- Sounds play through paplay (PulseAudio / PipeWire), pw-play or ffplay, whichever can play the file (MP3 goes to ffplay, which comes with ffmpeg). A missing file or theme sound falls back to the system's message sound and says so in the status bar; with no player at all the desktop beep is used.
+- The same alert's sound isn't restarted on top of itself when several arrive at once.
+- New tests (22).
+
 ## v1.1.84: Scanner Information as a Plasma widget
 
 - **New: an SDS100 Scanner widget for KDE Plasma 6.** Right-click the desktop or a panel → Add Widgets… and search for "SDS100".

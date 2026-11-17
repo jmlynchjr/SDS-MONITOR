@@ -1,6 +1,6 @@
 # SDS100 Monitor
 
-Live monitoring and control of a **Uniden SDS100** scanner from a Linux PC, over the scanner's USB serial port.
+Live monitoring and control of a **Uniden SDS100** scanner from a Linux PC, over the scanner's USB serial port. The SDS150 works the same way, and the SDS200 over USB or its network port.
 
 It shows what the scanner is receiving, keeps a searchable reception history, records and transcribes calls, and puts the scanner's controls, menus and analysis tools on your screen. Written in Python with PyQt6, developed and used on Kubuntu.
 
@@ -10,10 +10,10 @@ It shows what the scanner is receiving, keeps a searchable reception history, re
 
 ## What it does
 
-- **Live display:** system, department, channel, frequency, talkgroup, unit ID, signal, site and mode, with alerts on anything you choose, and phone alerts (ntfy, Pushover, Telegram or e-mail).
+- **Live display:** system, department, channel, frequency, talkgroup, unit ID, signal, site and mode, with alerts on anything you choose (each kind with its own sound), and phone alerts (ntfy, Pushover, Telegram or e-mail).
 - **Scanner control:** virtual keypad and knob, hold, avoid, jump to number tags, scanner menus, Close Call, Discovery, Weather (with SAME group names and Weather Alert Priority) and Tone-Out modes, a command console, screen mirror, waterfall, battery, and push updates.
 - **Reception history:** every transmission in daily CSV files, with search, statistics, activity charts, unit ID log, unit names and profiles, fleet maps and Search Everything.
-- **Audio:** one MP3 per transmission from your PC's audio input, with metadata, and offline speech-to-text transcription (faster-whisper).
+- **Audio:** one MP3 per transmission from your PC's audio input (or, from an SDS200, its own audio over the network), with metadata, and offline speech-to-text transcription (faster-whisper).
 - **Analysis:** incidents with one-line headlines and timelines, daily reports (window, PDF or HTML), Activity Watch for unusual activity, the scanner's Analyze functions (site health, channel load, unknown talkgroup and unit finder), and an antenna test.
 - **Ten codes:** look-up by agency and location, decoded in transcripts (ships with the APCO 1974 list; add your own lists).
 - **Aircraft (ADS-B):** with readsb or dump1090 on the same PC, alerts on emergency squawks and watched aircraft, and matches callsigns heard in airband transcripts to the aircraft in range.
@@ -34,6 +34,8 @@ apt installs what it needs (PyQt6 and pyserial; Qt Multimedia and ffmpeg are rec
 
 Connect the SDS100 by USB and choose **Serial Port** on the scanner when it asks.
 
+**SDS200 over the network:** at the top of the window choose **Link → Network (SDS200)** and type the scanner's IP address (from its network settings). To record its audio without a cable, choose **SDS200 network audio (RTSP)** as the INPUT in PC AUDIO CAPTURE. The Monitor talks to the scanner on UDP port 50536 and receives its audio over RTSP (port 554), so these must not be blocked between the PC and the scanner. (Network support is new in 1.1.89 and not yet tested on a real SDS200; reports are welcome.)
+
 Other distributions: install PyQt6 and pyserial for Python 3 and run `python3 sds100_monitor.py` from this folder (or `bash install.sh` to add a menu entry).
 
 ## Updates
@@ -46,7 +48,7 @@ Everything the Monitor records stays on your PC, in `~/SDS100Monitor`: reception
 
 ## Testing
 
-`bash run_tests.sh` runs the automated tests (about 100, a few seconds; add `-v` to list them). They never touch your real data, settings or scanner: every test works in its own throw-away home folder and no serial port is opened.
+`bash run_tests.sh` runs the automated tests (nearly 300, a few seconds; add `-v` to list them). They never touch your real data, settings or scanner: every test works in its own throw-away home folder and no serial port is opened (the network tests use a simulated SDS200 on 127.0.0.1).
 
 - Most tests run the program's logic on a stand-in for Qt, so they run anywhere, including on GitHub.
 - Where PyQt6 is installed, two more start the real program on the real Qt, off screen: one triggers every menu command, opens every window and switches themes; the other starts and closes the program and fails on any crash.

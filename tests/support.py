@@ -55,6 +55,12 @@ class Settings(dict):
     def sync(self):
         pass
 
+    def allKeys(self):
+        return list(self)
+
+    def fileName(self):
+        return str(mon.settings_file_path())
+
 
 mon.QSettings = Settings
 
