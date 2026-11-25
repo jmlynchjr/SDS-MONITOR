@@ -7,5 +7,6 @@
     <entry name="pollInterval" type="Int"><default>500</default></entry>
     <entry name="showButtons" type="Bool"><default>true</default></entry>
     <entry name="compactText" type="String"><default>{Channel} • {Frequency}</default></entry>
+    <entry name="showToday" type="Bool"><default>true</default></entry>
   </group>
 </kcfg>

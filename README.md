@@ -18,6 +18,8 @@ It shows what the scanner is receiving, keeps a searchable reception history, re
 - **Ten codes:** look-up by agency and location, decoded in transcripts (ships with the APCO 1974 list; add your own lists).
 - **Aircraft (ADS-B):** with readsb or dump1090 on the same PC, alerts on emergency squawks and watched aircraft, and matches callsigns heard in airband transcripts to the aircraft in range.
 - **Rdio Scanner:** sends each recorded call to your Rdio Scanner server, to listen on your phone with talkgroup and unit names, at home or (through a VPN such as Tailscale) away.
+- **SDRTrunk as a second receiver:** SDRTrunk sends its calls to the Monitor the way it sends them to Rdio Scanner; calls only SDRTrunk heard are added to the history, and calls the scanner heard too are merged with the scanner's call.
+- **GQRX as a second receiver:** each time GQRX's squelch opens (shortwave or anything else it tunes), the Monitor logs and records a reception, named from your GQRX bookmarks. Right-click a reception, hit or the waterfall → Tune GQRX Here, or let GQRX follow the scanner. Close Call frequencies, search hits and conventional channels the scanner heard can be exported as GQRX bookmarks. GQRX Scan steps GQRX through your bookmarks or a frequency range and stops on signals.
 - **Places and GPS:** keeps the scanner's location updated from a GPS receiver or your phone, and maps the places mentioned in transcripts (OpenStreetMap).
 - **SDS-Manager link:** with [SDS-Manager](https://github.com/jmlynchjr/SDS-Manager) (a separate program for the scanner's Favorites Lists) installed, right-click a reception → **Edit in Manager…** or **Add to Favorites List in Manager…**; quick key names, number tags and scan profiles come from SDS-Manager, and a warning shows when the scanner is out of date.
 - **Plasma widget:** the Scanner Information panel as a KDE Plasma 6 widget, on a panel (channel and frequency, click for the full panel) or the desktop, with Hold, Scan and Avoid buttons. The .deb installs it; add it with **Add Widgets…** → "SDS100".
@@ -48,7 +50,7 @@ Everything the Monitor records stays on your PC, in `~/SDS100Monitor`: reception
 
 ## Testing
 
-`bash run_tests.sh` runs the automated tests (nearly 300, a few seconds; add `-v` to list them). They never touch your real data, settings or scanner: every test works in its own throw-away home folder and no serial port is opened (the network tests use a simulated SDS200 on 127.0.0.1).
+`bash run_tests.sh` runs the automated tests (about 300, a few seconds; add `-v` to list them). They never touch your real data, settings or scanner: every test works in its own throw-away home folder and no serial port is opened (the network tests use a simulated SDS200 on 127.0.0.1).
 
 - Most tests run the program's logic on a stand-in for Qt, so they run anywhere, including on GitHub.
 - Where PyQt6 is installed, two more start the real program on the real Qt, off screen: one triggers every menu command, opens every window and switches themes; the other starts and closes the program and fails on any crash.

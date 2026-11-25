@@ -278,6 +278,32 @@ PlasmoidItem {
                 }
             }
 
+            // v1.1.93: today so far (calls, incidents going on, the last alert), worked out by the Monitor
+            ColumnLayout {
+                visible: !!(root.reachable && Plasmoid.configuration.showToday && root.scanner
+                            && root.scanner.today && root.scanner.today.length > 0)
+                Layout.fillWidth: true
+                Layout.topMargin: Kirigami.Units.smallSpacing
+                spacing: 0
+                Kirigami.Separator { Layout.fillWidth: true }
+                Repeater {
+                    model: root.scanner && root.scanner.today ? root.scanner.today : []
+                    delegate: PlasmaComponents.Label {
+                        required property string modelData
+                        required property int index
+                        Layout.fillWidth: true
+                        text: modelData
+                        wrapMode: Text.Wrap
+                        maximumLineCount: 2
+                        elide: Text.ElideRight
+                        font.bold: index === 0
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                        color: modelData.startsWith("▶") ? Kirigami.Theme.neutralTextColor
+                                                          : Kirigami.Theme.textColor
+                    }
+                }
+            }
+
             PlasmaComponents.Button {
                 visible: !root.reachable
                 text: i18n("Start SDS100 Monitor")

@@ -2,6 +2,299 @@
 
 Newest first. Versions before 1.1.47 were tested by hand on a real SDS100; from 1.1.47 on, every version also passes the automated tests.
 
+## v1.2.0: One Settings window
+
+- **New: Tools → Settings…** (Ctrl+,) holds every setting in one window, with a list of pages on the left: Connection; Appearance (with Scanner Information panel and Plasma widget); PC audio capture; Transcription; Alerts (with Alert sounds, Phone alerts, Activity Watch, Weather and Tone-Out, Close Call, Incidents, Aircraft (ADS-B)); Other receivers (SDRTrunk, GQRX, Rdio Scanner); GPS and maps; Reports; Analyze logging; Storage; Macro keypad; Updates.
+  - **Save** saves every page you opened and closes, **Apply** saves and keeps the window open, and **Cancel** (or Esc) saves nothing. Alert sounds are the exception: as before, changes there are kept straight away.
+  - Each page scrolls when the window is small, and the window remembers its size.
+- **Moved out of the menus:** View → Customize Scanner Information… and View → Theme; Tools → SDRTrunk Receiver… and GQRX…; Tools → Alerts → Alert Sounds…, Phone Alerts… and Send Calls to Rdio Scanner…; Tools → Maps → GPS…; Tools → Plasma Widget; Tools → Macro Keypad; Modes → Weather → Name SAME Groups…. The windows you work in stay where they were: Activity Watch, Places and Map, Aircraft, GQRX Scan, Storage, Ten Codes, and the rest.
+- **Moved out of the tool windows** (they keep only what you work with, plus a **SETTINGS…** button that opens their page):
+  - main window: Baud, Polling, Push updates, Connect at startup and Reconnect automatically (Link, Port and CONNECT stay);
+  - Scanner Tools → Alerts: desktop notification, sound and repeat time;
+  - Activity Watch: everything in its ALERTS box (IGNORE LIST… and PHONE ALERTS… stay as buttons);
+  - Incidents: how calls are joined (minutes apart, at least, same place, back in service) and the alert when an incident grows;
+  - Close Call: the new-frequency alert and its minimum signal;
+  - Weather and Tone-Out: whether alerts go to the PC and phone, and the SAME group names;
+  - Storage: the rules (the window keeps the overview, PREVIEW and CLEAN UP NOW);
+  - Daily Report: automatic saving and the daily phone summary (its button is now **SEND SUMMARY NOW**);
+  - Aircraft: the ADS-B source and the alert and matching options (the watch list stays);
+  - Places and Map: area, distance and finding places in new transcripts (LANDMARKS stays);
+  - Analyze: saving site health, channel load and the activity log to files;
+  - Check for Updates: checking at start-up and the GitHub repository.
+- The **SETTINGS…**, **SOUNDS…** and **PHONE ALERTS…** buttons in the panels and windows, and the GPS indicator in the status bar, now open the Settings window at their page.
+- Nothing about how a setting works has changed, and nothing you had set is lost: the settings file is the same.
+- New tests (11).
+
+## v1.1.116: Weather alerts reach the desktop and phone again; Phone alerts window
+
+- **Fixed: a weather alert was logged but never shown on the desktop or sent to the phone.** The scanner's alert pop-up (*Warning WX / WX Alert*) has a hidden control character between its two lines. The desktop pop-up command refused text with it, and that stopped the whole alert before the sound and the phone message. Found with the NOAA weekly test on Wednesday, Nov 25 (Weather Alert Priority, SAME 1).
+  - Control characters in the scanner's screen text, and in any alert, now become a space (*Warning WX WX Alert*).
+  - If the desktop pop-up fails for any reason, the sound still plays and the phone alert is still sent. The status bar says what went wrong.
+  - A Weather or Tone-Out alert is no longer dropped without a word. If it isn't shown or sent, the Weather and Tone-Out window and the status bar say why: the *Alert on the PC and phone…* box is unticked, or sending failed. The reason is also kept in `~/SDS100Monitor/mode_alerts/problems.log`.
+- **Fixed: the Phone alerts window squeezed its boxes.** *No more than … a hour* and the quiet-hours times were cut in half. They now have rows of their own at full size, the settings scroll when the window is small, and the window opens larger (720 × up to 940).
+- New tests (6), including one that takes a weather alert all the way to the desktop pop-up and the phone. The earlier tests stopped short of that step.
+
+## v1.1.115: Storage
+
+- **New: Tools → Storage…** shows what the Monitor's data takes and cleans up by rules you set.
+  - **Overview:** the size, number of files and growth a day (average of the last 7 days) of each kind of data, the total, the free space on the disk, and how many days that lasts at this rate.
+  - **Rules**, all settable: recordings (MP3s) **90 days** and at most **20 GB** (the oldest go first); the Analyze activity log **30 days**; backups **the newest 5**; incident packages, saved reports, and the history, transcripts and other logs **forever** (they can be given a number of days too: at least 30 for packages and reports, 60 for the logs, which statistics, Activity Watch, incidents, reports and name learning are built from).
+  - **Keep free on the disk** (5 GB to begin with): when the free space drops under it, the oldest recordings older than 7 days go first, and you get an alert if it is still low.
+  - **Always kept:** recordings of calls in incidents you changed or wrote a note on, calls whose transcript you corrected, and calls that set off an alert (keyword, alert rule, Tone-Out, Weather, Close Call). When a recording goes, its history row, transcript and incident stay; only the audio is gone.
+  - **PREVIEW** lists what the rules would remove now, with the day, size and reason, and removes nothing. **CLEAN UP NOW…** asks first. Everything removed is listed in `~/SDS100Monitor/storage_log.csv`.
+  - **Automatic cleanup is off** until you tick *Clean up automatically* and save; then it runs once a day in the background, and whenever the disk gets low.
+- New tests (11).
+
+## v1.1.114: Attenuator test shows what it is doing
+
+- **Fixed: the attenuator test looked as if it did nothing.** It only said which round it was on, and showed results at the very end (about 15 minutes for a site and NOAA in 4 rounds). Now, while it runs, it shows:
+  - what it is doing right now: getting ready, waiting for the scanner to reach the site or frequency (with the seconds before it gives up), or measuring it, with the time left, how many readings it has and the latest decode quality, signal and dBm;
+  - *No readings are arriving from the scanner* when the scanner sends nothing to measure;
+  - a line for each site or frequency as it finishes, with how many readings it got, or why it was skipped (for example *the scanner didn't confirm the site: Analyze → System Status gave no readings for that site index*);
+  - the results so far after each off-and-on pair of rounds, not only at the end.
+- **Antenna Test (and so the attenuator test) waits up to 30 seconds** for Analyze → System Status to lock on to a site, instead of 15.
+- New tests (2).
+
+## v1.1.113: Set the attenuator in SDS-Manager
+
+- **New: send an attenuator setting to SDS-Manager** (0.1.41 or later), so it is kept in your Favorites Lists and Export to Scanner doesn't undo it.
+  - In **Tools → Signal and Attenuator…**, right-click a site or channel in the report → **Attenuator On / Off for this site (or channel) in SDS-Manager…**.
+  - After an attenuator test, select a site or frequency in the results and press **SET IN SDS-MANAGER** to send the test's verdict, or right-click it to choose On or Off yourself.
+  - SDS-Manager comes to the front (it is started if it isn't running), lists every place it would change, a trunked site of that name in the same system or the conventional channels on that frequency, with the setting now, and changes nothing until you press **CHANGE** there. Then Save Configuration and Export to Scanner as usual.
+- New tests (3).
+
+## v1.1.112: Audio Level Check no longer squeezed
+
+- **Fixed: the Signal and attenuator tab of Audio Level Check was unreadable.** Its report table was squeezed to one row and the test's table to slivers with cut-off headings. Now, in every tab of the window:
+  - each table keeps room for at least five to eight rows and each list for four items;
+  - each tab scrolls when the window is too small for it, instead of squeezing what's in it;
+  - columns are as wide as their contents, and the last one takes the rest and wraps;
+  - the window opens larger (1120 × 900) the first time.
+- The same rules are now used for new windows, and applied to GQRX Scan's tag list and Stopped-on table.
+- New tests (4).
+
+## v1.1.111: Signal and attenuator
+
+- **New: Tools → Signal and Attenuator…** (also the **Signal and attenuator** tab in Audio Level Check) advises where the scanner's attenuator helps. The attenuator cuts the radio signal before the scanner decodes it: it helps where a signal is strong enough to overload the scanner (distorted audio, garbled digital voice, other signals mixing in), can help on simulcast systems, and hurts on weak channels. It doesn't change how loud the audio is.
+  - **Report:** for the last 7, 30 or 90 days, per trunked site and per conventional channel: calls, median signal and the weakest 10%, how often the attenuator was on, decode quality (from Analyze → System Status with site health saved), and advice, most urgent first: *weak with the attenuator on: turn it off*; *strong but decoding poorly: try the attenuator*; *strong: safe to attenuate, test it*; *weak: keep it off*. Search and Close Call hits aren't judged.
+  - **Attenuator test:** measures the sites and frequencies you tick (your Antenna Test references) with the scanner's global attenuator off, then on, then off and on again, so changing conditions cancel out, and says which is better for each. It is judged on decode quality, digital decoding, transmissions heard and interference, never on the signal level (which always drops with the attenuator). The global attenuator is put back as it was afterwards; the results are also in Antenna Test → Compare.
+- **New: signal log.** Every reception's signal readings (lowest, median, strongest) and whether the attenuator was on are kept in `~/SDS100Monitor/signal/`. Days from before this version use the first signal reading in the reception history, with the attenuator unknown.
+- Worked out by rules, without AI; the scanner's signal readings aren't calibrated, so the thresholds (−50 dBm strong, −95 dBm weak) are starting points and the test decides.
+- New tests (12).
+
+## v1.1.110: Audio Level Check fix
+
+- **Fixed: nothing could be clicked in Audio Level Check when it was opened from Transcription → SETTINGS….** The settings window keeps the rest of the Monitor waiting until it is closed, which also blocked the level check opened from it. **AUDIO LEVEL CHECK…** there now saves the settings, closes that window and then opens the level check. Opening it from **Tools** or **LEVEL CHECK…** under PC AUDIO CAPTURE was not affected.
+- New test (1).
+
+## v1.1.109: Audio Level Check
+
+- **New: Tools → Audio Level Check…** (also **LEVEL CHECK…** under PC AUDIO CAPTURE, and in Transcription → SETTINGS…) helps set the level that transcribes best: speech peaks between −12 and −3 dBFS, never clipped. Three tabs:
+  - **Live:** the input level now, and for each transmission its loudest moment with a verdict (good, too quiet, a little loud, clipped) and a running count. Turn the scanner's volume while calls come in and watch where they land.
+  - **Recent recordings:** measures the last 25–200 scanner recordings (not SDRTrunk's or GQRX's): peak, speech level, noise floor, speech over the noise and clipping, overall and per channel, with what to do: for example *Too quiet: raise the scanner volume about 14 dB*, or *clipped on 9 of 50 recordings: lower the volume or the PC's input level*. When speech is close to the noise it says so: that's the signal, not the volume.
+  - **Transcription test:** transcribes 5, 10 or 20 recent calls at five levels (as recorded, 6 dB quieter, 6 and 12 dB louder, and normalized) and compares how sure the speech engine was, with every transcript side by side. It runs on your engine and model after any new calls, and changes no recordings or transcripts. It says which level won and what to change.
+- **New: Normalize the level before transcribing** (Transcription → SETTINGS…, or the button on the test tab; off to begin with). Each call's level is evened out before the speech engine hears it, so speech sits around −20 dBFS, quiet calls are made louder and loud ones quieter, and nothing is clipped. The MP3s stay as recorded.
+- The speech engine now also reports how sure it was of each transcript (used by the test).
+- Worked out by rules, without AI; the scanner's volume steps have no published size in dB, so changes are given in dB and you measure again after changing.
+- New tests (17).
+
+## v1.1.108: Transcription fix
+
+- **Fixed: 1.1.107 made transcripts worse.** The short list of ten codes 1.1.107 added to what the speech engine is told to expect (10-4, 10-8, 10-23, 10-50, 10-81) made it write loops such as *10, 10, 10, 10, …* instead of what was said, especially with the distil-large-v3 model. It is taken out again. Recognising codes the engine writes as one number (*1081*, *104*) stays: that is done on the text afterwards and doesn't affect the transcribing.
+- **New: loops are dropped.** A word written more than three times in a row (*10, 10, 10, 10, …*) is the speech engine stuck on noise or a short burst, not speech, and is left out of the transcript; so is a part the engine itself marks as a loop. A code said twice (*104, 104*) is kept.
+- **TRANSCRIBE THIS DAY** can now also redo transcripts a day already has: **WITHOUT A TRANSCRIPT** does only the recordings with none, as before; **ALL AGAIN** redoes the rest too, for example the calls transcribed by 1.1.107, older transcripts without *who said what*, or after changing the model or vocabulary. Transcripts you corrected are kept.
+- New tests (2).
+
+## v1.1.107: Ten codes written as "1081"
+
+- **Fixed: a ten code the speech engine wrote as one number ("1081" for 10-81, "104" for 10-4) wasn't recognised.** Such a number now counts as a ten code when a ten-code list in use has that code and nothing around it says it is something else:
+  - not before a street or route (*1081 Main Street*, *1050 block of …*, *1012 Hwy 14*);
+  - not after a unit, station, road or place word, or a name (*Engine 104*, *Station 1081*, *Highway 1012*, *apartment 1081*, *at 1081*, *Greer 1081*);
+  - not part of a time, phone number, amount, decimal or longer number, and not before *degrees*, *miles*, *minutes* and the like;
+  - three digits (*104*) only at the end of a phrase, as in *Copy, 104.*
+  It works on transcripts you already have, straight away: the Transcription window, incidents, headlines, types, the step-by-step summary, *back in service* (1.1.106) and the reports all see the codes.
+- **Transcription** now also shows the speech engine a few ten codes written the usual way (10-4, 10-8, 10-23, 10-50, 10-81), so new transcripts are more likely to write *10-81* in the first place.
+- New tests (5).
+
+## v1.1.106: Two new ways of joining calls into incidents
+
+- **New: the same place joins calls.** Calls that name the same address, intersection or landmark within 30 minutes belong to one incident, whatever radios are in them: for example the deputy sent to *100 North Main Street* joins the fire already there, and a call without a unit ID joins when it names the place. *100 N Main St* and *100 North Main Street*, or *Main and 5th* and *5th at Main*, count as the same place.
+- **New: back in service leaves the incident.** A unit that says it is back in service or available (*in service*, *available*, *clear the scene*, *back in quarters*, or a ten code meaning that, such as 10-8 on most lists) leaves the incident: its next call no longer joins it just because it is the same radio. This stops one busy unit chaining separate calls into one long incident. With transcripts split by speaker (1.1.105) only the radio that said it leaves; otherwise only when it is the only field unit on the call.
+- Both are on to begin with, and can be switched off with **Same place joins** and **Back in service leaves** at the top of History → Incidents…. They apply everywhere incidents are worked out: the daily and period reports, Search Everything, the incident alert and the Plasma widget.
+- **History → Incident Accuracy…** now compares the joining rules on your own fixes: the old way, each new rule alone, and both, with *kept together* and *found together* for each. Your fixes were made on incidents joined the old way, so that is what they are applied to; *kept together* and *found together* at the top now describe the rules you have chosen.
+- New tests (8).
+
+## v1.1.105: Transcripts split by who is talking
+
+- **New: who said what.** One recording often holds several transmissions: the scanner stays on a talkgroup while dispatch and a unit answer each other. Transcripts are now split one line per radio, for example *Dispatch (UID:3231467): Engine 12, respond to 100 Main.* / *Engine 12 (UID:3237894): Engine 12 copy, en route.*
+  - The speech engine now keeps the time of every word (`transcript_words_YYYY-MM-DD.jsonl` beside the transcripts), and PC audio capture notes when each radio keyed up during a recording (`recording_marks_YYYY-MM-DD.jsonl`). Each word goes to the radio talking then; the split is moved to the longest pause near each change, because the scanner reports a radio a moment after it keys up. On the SDS200's network audio the stream delay is allowed for.
+  - Recordings made before this version have no keyup marks: the unit ID log is used instead (whole seconds, so less exact). Calls with no unit IDs (analog) are only split at pauses of 1.5 s or more, without names.
+  - Shown in **Transcription** (in the list, and as *Who said what* under the transcript), on the incident **Calls** tab, in **EXPORT INCIDENT…** and in incident packages (page and calls.csv). The transcript itself is unchanged, so search, keyword alerts, ten codes and places work as before.
+  - **Incidents:** when a call is split, *en route*, *on scene*, *transporting* and *back in service* go only to the radio that said it, instead of every radio in the call. The unit bars follow.
+  - **Unit Name Suggestions** also learn from calls with more than one radio, from each radio's own part.
+  - Transcripts made before this version have no word times: **TRANSCRIBE AGAIN** or **TRANSCRIBE THIS DAY** in Transcription gives them the split. A transcript you corrected by hand isn't split.
+  - **Transcription → SETTINGS… → Split transcripts by who is talking** (on to begin with) turns the word times off; transcribing is a little slower with them.
+  - Worked out by rules, without AI: a word or two at a change of speaker can land on the wrong side, and a very quick exchange can be missed.
+- New tests (14).
+
+## v1.1.104: Edit transcripts from the Incidents window
+
+- **New: correct a call's transcript in History → Incidents….** On the **Calls** tab, right-click a call → **Edit Transcript…**, or select it and press **EDIT TRANSCRIPT…**. The window shows the call's time, talkgroup and units, with **▶ PLAY** to listen while you type; **SAVE** keeps your wording.
+  - It is saved exactly as **SAVE CORRECTION** in Transcription saves it (the model column then says *(corrected)*), and an open Transcription window shows it straight away.
+  - A recorded call that was never transcribed can be given a transcript the same way. A call with no recording can't, and the Monitor says so.
+  - The incident is then worked out again with the new words, so its headline, type, step-by-step summary and ten codes follow your correction, and the same call stays selected.
+- New tests (2).
+
+## v1.1.103: Incidents window no longer crowds out its list
+
+- **Fixed: in History → Incidents…, a big incident squeezed the incident list down to one row.** The step-by-step summary, the unit bars and the calls were stacked under the list and took all the room. Now:
+  - they are three tabs under the list: **Step by step**, **Units over time (n)** and **Calls (n)**, each scrolling on its own; the tab you used last opens next time;
+  - the list always keeps room for about five incidents, and the bar between the list and the tabs can be dragged; where you leave it is remembered;
+  - the line above the tabs names the first six units and *+n more*; hover over it for all of them. The full list is also at the top of **Step by step** and in **EXPORT INCIDENT…**.
+- New tests (2).
+
+## v1.1.102: Incident accuracy report
+
+- **New: History → Incident Accuracy…** measures how well the Monitor joins calls into incidents, using your own fixes in **History → Incidents…** (merges, splits, calls taken out, hidden incidents, types you set). For each day you fixed something it works the incidents out twice, without and with your fixes, and compares them:
+  - how many incidents it found and how many you changed or hid, and how many fixes of each kind you made;
+  - **Kept together:** of the call pairs the Monitor put in one incident, the share you left together. Low means incidents **run together** (you had to split them or take calls out).
+  - **Found together:** of the call pairs that belong together after your fixes, the share the Monitor had already joined. Low means incidents **broken up** (you had to merge them).
+  - a one-line conclusion naming the main kind of mistake;
+  - where the fixes were, by talkgroup or channel, and which incident types you changed (worked out → yours).
+  Choose the last 30 or 90 days, the last year or all your fixes; **COPY** copies the report as text. Only days with fixes are counted, since a day you checked and found right can't be told from one you never opened. The report is worked out by fixed rules and is only as good as the fixes it's given. It's the measure for the next changes to how incidents are joined.
+- New tests (8).
+
+## v1.1.101: Scanner Screen shows the scanner's icons
+
+- **Fixed: squares at the ends of lines in the Scanner Screen window.** The scanner draws a few icons with character codes of its own, and the Monitor read them as text it couldn't show. It now reads the screen byte for byte and draws them:
+  - **…** where the scanner cuts a name short, for example *Greenville County Simulc…* (codes 0x06 0x07);
+  - the **signal bars** beside the clock (codes 0xAC 0xAD; 0xA4–0xAD are taken as 0 to 4 bars);
+  - any other icon code as a dim dot. **Copy Screen Text** writes *…* and the bars as characters, and an unknown icon as its code, for example `{0x1A}`, so new ones can be added.
+  Found from a real SDS100 screen reply (firmware 1.26.01).
+- **Fixed: the Plasma widget's *Today* lines could wait up to two minutes after the PC started** (a timer counted from the PC's start instead of from never).
+- New tests (4).
+
+## v1.1.100: Choose and arrange the reception history and statistics columns
+
+- **New: move, hide and show columns** in the main window's **Reception History** and **Reception Statistics**:
+  - **Drag a column heading** left or right to move the column.
+  - **Right-click a heading** for the list of columns: tick or untick each one to show or hide it. **Show All Columns** brings back any hidden ones; **Reset Columns** puts the order, widths and columns back as they came. At least one column always stays.
+  - The order, the hidden columns and (in Reception History) the widths are remembered for next time. They are kept by column name, so a column added in a later version simply appears at the end.
+  - Only the window changes: the CSV files, exports, copying a row and the search box still use every column.
+- New tests (6).
+
+## v1.1.99: Scanner Control fits a narrow panel
+
+- **Fixed: a narrow Scanner Control panel cut its contents off.** Making the panel narrower left its contents at full width, so the sound input, the input level, the status lines and the right-hand buttons were cut off, with a sideways scroll bar. Now everything in the panel gets narrower with it:
+  - the control buttons (RESUME SCAN, CHANNEL HOLD…), READ CLOCK / SET CLOCK FROM PC and SETTINGS… / RECORDINGS… go one under the other when there isn't room for two side by side;
+  - lists such as the sound input and the number tag list show shortened text (the full text is in the list when you open it);
+  - status lines and notes wrap onto more lines;
+  - the panel no longer scrolls sideways, only up and down.
+- New tests (2).
+
+## v1.1.98: Scan with GQRX
+
+- **New: GQRX Scan.** **Tools → GQRX Scan…** (or **SCAN…** in Tools → GQRX…) turns GQRX into a scanner: the Monitor tunes GQRX from one frequency to the next and stops when GQRX's squelch opens. It stays until the signal has been gone for **Ends after** (Tools → GQRX…, 2 s), then carries on.
+  - **What to scan:** **GQRX bookmarks**, with the tags you tick (your own bookmarks, or the ones exported from the Monitor), or **a frequency range** from one frequency to another in steps of so many kHz (up to 20,000 frequencies), in one mode or by band. Bookmarks are scanned in their own mode and bandwidth.
+  - **Time on each frequency** (200 ms to begin with) sets the speed: about 4 frequencies a second. Shorter scans faster, but GQRX's signal reading needs a moment to catch up after each change.
+  - **HOLD** stays on the frequency it stopped on, also after the signal goes; **RESUME** carries on. **SKIP THIS FREQUENCY** leaves it out until the scan is stopped.
+  - The window shows what is being scanned and how fast, or where it has stopped with the signal and squelch level, and lists every frequency it stopped on, newest first. Double-click one to stop the scan and listen there.
+  - With logging on in Tools → GQRX…, what the scan stops on is logged and recorded like any GQRX reception, even while GQRX would otherwise follow the scanner (following waits while GQRX scans).
+  - The scan won't run with GQRX's squelch off, and says so.
+- New tests (9).
+
+## v1.1.97: GQRX bookmarks from what the scanner heard
+
+- **New: Export GQRX Bookmarks.** **Tools → GQRX… → EXPORT BOOKMARKS…** adds the frequencies the scanner has heard to GQRX's bookmarks (`~/.config/gqrx/bookmarks.csv`), so they show as labels on GQRX's waterfall and in its bookmark list, ready to tune.
+  - Choose what goes in: **Close Call frequencies** (with your names from the Close Call window; ignored ones left out), **Custom Search and Discovery hits**, and **conventional channels** the scanner heard (with the scanner's channel names). Trunked talkgroups aren't included, and neither are SDRTrunk's or GQRX's own receptions. Choose **Heard in**: the last 30 or 90 days, the last year or all history. The window lists every frequency before you export.
+  - Tags: *SDS Close Call*, *SDS Search hits*, and *SDS* plus the system name for channels, each with its own colour in GQRX. The best name wins when a frequency was heard several ways: your Close Call name, then the scanner's channel name, then an unnamed Close Call or search hit.
+  - The mode comes from the recordings (AM, Narrow FM, USB…), or from the band.
+  - Your own GQRX bookmarks are kept, and a frequency you have bookmarked already (within 1 kHz) is left out. Exporting again replaces what the last export added (bookmarks whose tags all start with *SDS*). The old file is copied first (`bookmarks.csv.before-sds-…`).
+  - GQRX writes its bookmarks when it closes, so the export waits until GQRX is closed and says so.
+- New tests (5).
+
+## v1.1.96: Tune GQRX from the Monitor, and GQRX following the scanner
+
+- **New: Tune GQRX Here.** Right-click a reception in the history, a Close Call frequency, a Custom Search or Discovery hit, the Scanner Information panel, or the waterfall graph → **Tune GQRX Here**. GQRX jumps to that frequency, so you can look at the signal on GQRX's own wide waterfall: its bandwidth, whether it's digital, whether it's interference. The waterfall's right-click menu also has **Tune Scanner Here**.
+  - The mode is the scanner's where GQRX has it (AM, FM, USB, LSB, CW). Digital modes (P25, DMR…) become FM: GQRX can't decode them, but shows and plays the signal. Otherwise the mode comes from the band: AM below 30 MHz and on airband, WFM on FM broadcast, FM elsewhere.
+  - It works whether or not the Monitor is logging GQRX; GQRX's Remote control must be on. The status bar says when GQRX has tuned, or why it couldn't.
+- **New: GQRX follows the scanner.** In **Tools → GQRX…**, under *Tuning GQRX*, **Follow the scanner** tunes GQRX to each conventional frequency the scanner stops on; **Also trunked voice channels** includes trunked calls (GQRX then jumps with every call). While GQRX follows the scanner, GQRX receptions aren't logged, since they would be the scanner's own calls a second time.
+- **New: tune GQRX by hand** from the same window: type a frequency in MHz, choose a mode or leave *Mode by band*, and press **TUNE GQRX**.
+- New tests (6).
+
+## v1.1.95: GQRX as a second receiver
+
+- **New: GQRX as a second receiver.** **Tools → GQRX…** connects to GQRX's remote control (port 7356 on this PC). Each time GQRX's squelch opens, the Monitor logs a reception and records it, so shortwave and other GQRX listening gets the reception history, recordings, transcription, alerts, incidents and reports. In GQRX: turn on **Remote control**, press **UDP** in the Audio panel (the Monitor records the audio it sends to port 7355), and set the squelch just above the noise.
+  - A reception lasts from the moment the signal reaches GQRX's squelch level until it stays below it for **Ends after** (2 s, so SSB speech stays in one piece). Shorter than **Shortest reception** (1 s) isn't logged; a broadcast station is split into pieces of **Longest piece** (5 minutes). Tuning GQRX to another frequency ends a reception.
+  - System is **GQRX** (you can rename it). Channel and department come from your GQRX bookmarks (name and tag) when one is on the frequency; otherwise the frequency and mode, for example *7200.0 kHz USB*, in department *Shortwave* below 30 MHz.
+  - Recordings are MP3s like the others (`…_gqrx.mp3`), with the mode in the recordings index. Without UDP audio, receptions are still logged.
+  - The window shows what GQRX is tuned to, its signal and squelch, whether the squelch is open, and whether audio is arriving. It warns when GQRX's squelch is off, since then nothing is logged.
+  - The Source column, the daily report and incident packages show **GQRX** for these receptions. They aren't sent to Rdio Scanner unless you tick that.
+- New tests (14).
+
+## v1.1.94: SDRTrunk as a second receiver
+
+- **New: SDRTrunk as a second receiver.** **Tools → SDRTrunk Receiver…** lets [SDRTrunk](https://github.com/DSheirer/sdrtrunk) send its calls to the Monitor, the same way it sends them to Rdio Scanner. In SDRTrunk add one more Rdio Scanner stream (Playlist Editor → Streaming) with the address and API key the window shows, and give that stream to the talkgroups you want in the Aliases tab. SDRTrunk's **Test** button works: the Monitor answers it the way Rdio Scanner 6 does.
+  - **Record what arrives** (the setting to start with): each upload is listed in the window with every field SDRTrunk sent (the key hidden), and its MP3 is kept in `~/SDS100Monitor/sdrtrunk/test/` (the newest 20). Nothing is added to the history. **COPY** copies the list.
+  - **Add calls to the Monitor:** each SDRTrunk call goes into the reception history, unit ID log and recordings like a scanner reception, so transcription, incidents, reports, Activity Watch, alerts, incident packages and SDS-Manager's Check Heard Talkgroups use it too. Names come from SDRTrunk's aliases, or else from the names the scanner uses for that talkgroup.
+  - **Heard by both:** when the scanner logged the same talkgroup at the same time (within 4 seconds, adjustable), the SDRTrunk call is merged into the scanner's call instead of added: its recording is kept with the call (and becomes the call's recording when the scanner call has none), and a radio ID the scanner missed is added. A call only SDRTrunk heard is added as a new call, so SDRTrunk fills the gaps. While the scanner is connected, an SDRTrunk call waits up to 10 seconds for the scanner's copy (longer while the scanner is still on that talkgroup). **Keep both as separate calls** turns merging off.
+  - **Systems:** SDRTrunk sends a system number. Name each one in the window; use the scanner's system name to merge only with that system's calls.
+  - It listens on this PC only (port 3011) unless you choose the local network, for SDRTrunk on another PC. Every upload needs the API key.
+  - SDRTrunk calls are not sent on to Rdio Scanner unless you tick **Also send SDRTrunk calls to Rdio Scanner** (SDRTrunk can send there itself; both would make every call twice).
+- **New: where each call came from.** The main window's reception history has a **Source** column (Scanner, SDRTrunk, or Scanner + SDRTrunk), also in Reception Details. Right-click a merged call → **Play SDRTrunk Recording** plays SDRTrunk's copy. The daily report shows calls per receiver once SDRTrunk has sent any, and incident packages show the source of each call (also a new **Source** column in `calls.csv`). The history files keep their format: the sources are kept beside them, in `~/SDS100Monitor/sources/`.
+- New tests (26).
+
+## v1.1.93: Incident packages, unit bars, today in the Plasma widget
+
+- **New: incident packages.** In **History → Incidents…**, **SAVE INCIDENT PACKAGE** (or right-click an incident → **Save Incident Package**) makes a folder in `~/SDS100Monitor/incidents/`, named by the start, the type and the headline, and a `.zip` of it ready to send:
+  - `index.html`: open it in a browser. Headline, date and times, type, your note, the step-by-step summary, the unit bars, places (with map links), ten codes, and every call with its time, talkgroup, units, length, transcript and a player for its recording.
+  - `recordings/`: copies of the calls' recordings (PC audio capture), numbered in order.
+  - `incident.pdf`: the same page without players (it lists the recording files).
+  - `calls.csv`: the calls, with the recording file of each.
+  - The window says how many recordings were included and offers **OPEN PAGE** and **OPEN FOLDER**. A package is never overwritten; a second one gets `_2`.
+  - Packages go in the **Recordings** part of Tools → Back Up Settings and Data…, since they are mostly recordings.
+- **New: a bar for each unit in an incident.** Under the step-by-step summary in the Incidents window (and in the package), each unit runs from its first call to its last: grey while it is only heard, then **en route**, **on scene** and **transporting** as the calls said, until **back in service** (✓). Small marks show its calls. A unit on scene or transporting with no "back in service" stays so until the incident ends.
+- **New: today in the Plasma widget.** Under the scanner panel: today's calls and incidents, the incidents going on now (a call in the last 10 minutes) with their headlines, and the last alert. The Monitor works it out every 2 minutes, only while the widget is showing. The widget's settings have **Today: Show today's calls, incidents going on and the last alert** to turn it off.
+- New tests (13).
+
+## v1.1.92: More in the daily report, SDS-Manager link, morning summary on the phone
+
+- **New sections in the daily report:**
+  - **Talkgroups and channels not heard in the previous 30 days** (and a count in the summary). Close Call hits are left out; they have their own section.
+  - **New Close Call frequencies:** frequencies with Close Call hits that day and none in the previous 30 days, with hits, first hit and your name for them.
+  - **Aircraft:** ADS-B alerts (emergency squawks, watched aircraft) and the callsigns heard on the air that were matched to ADS-B.
+  - **Site health:** from the site health log (Analyze), each site's average signal and decode quality, its worst decode quality and when, and how many logged intervals were under the low level set in Analyze.
+- **New: check heard talkgroups in SDS-Manager.** **Tools → Check Heard Talkgroups in SDS-Manager…** opens SDS-Manager's Check Heard Talkgroups with RadioReference (SDS-Manager 0.1.40 or later) for the last 30 days. In the report window, the link under the new talkgroups (daily) or *Heard for the first time* (weekly, monthly, range) opens it for the days of that report. Saved PDF and HTML reports keep the text without the link.
+- **New: a summary of each day on your phone.** In **History → Daily Report…**, tick **Send a summary of each day to my phone at** and choose the hour (7:00 to begin with). The next morning the day before is sent through Phone Alerts: calls and time on air (and busier or quieter than usual), incidents by type, time to first unit on scene, the biggest incident, new radios, talkgroups and Close Call frequencies, and alerts. It is sent once, even if the Monitor starts later that day; quiet hours and the alert kinds don't apply, the hourly limit does. **SEND NOW** sends the summary of the day shown.
+- New tests (11).
+
+## v1.1.91: Weekly, monthly and date-range reports
+
+- **New: reports for a week, a month or any range of days.** **History → Daily Report…** has a new **Report** choice: **Day** (the daily report, as before), **Week** (Monday–Sunday), **Month**, or **Date range** (from one day to another).
+  - **Summary:** receptions, time on air and calls per hour listened, each compared with the period just before (the previous week, the previous month, or a range of the same length); hours listened, the busiest day, systems, radios heard, talkgroups heard for the first time, incidents by type, the median time to first unit on scene, transcribed calls and alerts by kind.
+  - **Day by day:** a bar for each day's calls, with time on air, incidents and hours listened.
+  - **Activity by hour** across the whole period.
+  - **Busiest talkgroups and channels**, with their calls in the previous period beside them.
+  - **Rising and falling:** talkgroups at least twice as busy as in the previous period (20 calls or more), or half as busy or less (where 40 or more were expected), allowing for how long the Monitor was listening.
+  - **Heard for the first time:** talkgroups, channels and radios not heard in the 30 days before the period began.
+  - **Biggest incidents:** the 12 with the most units, with their type, headline, talkgroups and your notes.
+  - **Most active radios.**
+- **SAVE PDF…**, **SAVE HTML…** and **OPEN IN BROWSER** work for every kind of report.
+- **New: save each finished week and month automatically.** Beside the daily automatic saving, tick **and each finished week and month**: weekly reports (`weekly_report_YYYY-MM-DD`, named by the Monday) and monthly reports (`monthly_report_YYYY-MM`) are saved in the reports folder in the same formats, for the last 4 finished weeks and 2 finished months.
+- Each day is worked out once and kept while the Monitor runs, so a month is quick the second time; a day is worked out again when its history or your incident fixes change.
+- New tests (14).
+
+## v1.1.90: Start Rdio Scanner with the Monitor
+
+- **New: the Monitor can start Rdio Scanner for you.** In **Tools → Alerts → Send Calls to Rdio Scanner…**, tick **Start Rdio Scanner when the Monitor starts, if it isn't running**.
+  - A few seconds after the Monitor starts, it checks whether the server address answers. If it does, nothing is started. If it doesn't, and the address is this PC, the Monitor starts Rdio Scanner and waits up to 20 s for it to answer; calls that were waiting are then sent.
+  - **Start it with** lists what **DETECT** found on this PC: a systemd user service, a system service (which asks for your password each time), or the `rdio-scanner` program on the PATH or in the usual unpacked-release folders (`~/rdio-scanner…`, `~/Downloads/rdio-scanner…`, `/opt/rdio-scanner…`, `~/.local/bin`, `/usr/local/bin`). **Automatic** uses the first one found; **Program…** with **BROWSE…** chooses the file yourself, with optional **Arguments** (for example `-listen :3000`).
+  - A program is started in its own folder (where Rdio Scanner keeps its database), keeps running on its own, and writes its messages to `~/SDS100Monitor/rdio-scanner.log`.
+  - **Stop it when the Monitor closes** stops only a program the Monitor started itself. A service, or a server that was already running, is never stopped.
+  - **START NOW** does the same straight away. What happened is shown in the window and the status bar.
+  - A server on another computer is never started; the Monitor says so.
+- New tests (15), including starting and stopping a stand-in Rdio Scanner program for real.
+
 ## v1.1.89: SDS200 over the network
 
 - **New: connect to an SDS200 over its Ethernet port.** At the top, **Link** chooses **USB** (all models, as before) or **Network (SDS200)**. On Network, type the SDS200's IP address (from the scanner's network settings) where the port was; add `:port` only if it isn't the usual UDP 50536. Baud is hidden on Network.

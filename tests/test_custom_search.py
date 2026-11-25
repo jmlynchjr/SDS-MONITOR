@@ -103,7 +103,7 @@ class CustomSearchTests(unittest.TestCase):
 
     def test_tools_menu_groups(self):
         src = inspect.getsource(mon.Monitor)
-        for sub in ('addMenu("Scanner")', 'addMenu("Alerts")', 'addMenu("Maps")', 'addMenu("Macro Keypad")'):
+        for sub in ('addMenu("Scanner")', 'addMenu("Alerts")', 'addMenu("Maps")'):   # Macro Keypad: Settings (1.2.0)
             self.assertIn("tools_menu." + sub, src)
         self.assertIn('tools_menu.addAction("Custom Search…"', src)
 

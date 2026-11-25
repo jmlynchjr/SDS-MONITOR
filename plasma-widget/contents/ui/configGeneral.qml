@@ -10,9 +10,11 @@ KCM.SimpleKCM {
     property alias cfg_pollInterval: poll.value
     property alias cfg_showButtons: buttons.checked
     property alias cfg_compactText: compact.text
+    property alias cfg_showToday: today.checked
     property int cfg_pollIntervalDefault
     property bool cfg_showButtonsDefault
     property string cfg_compactTextDefault
+    property bool cfg_showTodayDefault
 
     Kirigami.FormLayout {
         QQC2.SpinBox {
@@ -26,6 +28,11 @@ KCM.SimpleKCM {
             id: buttons
             Kirigami.FormData.label: i18n("Buttons:")
             text: i18n("Show Hold, Scan and Avoid")
+        }
+        QQC2.CheckBox {
+            id: today
+            Kirigami.FormData.label: i18n("Today:")
+            text: i18n("Show today's calls, incidents going on and the last alert")
         }
         QQC2.TextField {
             id: compact

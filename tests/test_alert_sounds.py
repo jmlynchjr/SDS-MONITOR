@@ -176,7 +176,7 @@ class DialogTests(unittest.TestCase):
 
     def test_menu_entry(self):
         source = Path(mon.__file__).read_text(encoding="utf-8")
-        self.assertIn('alerts_sub.addAction("Alert Sounds…"', source)
+        self.assertIn('("sounds", "Alert sounds", "alerts")', source)       # v1.2.0: a Settings page
 
 
 if __name__ == "__main__":
